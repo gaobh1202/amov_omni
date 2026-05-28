@@ -1,8 +1,7 @@
 # hydra.job.chdir: false
 hydra:
   searchpath:
-  # see https://hydra.cc/docs/advanced/search_path/
-   - file://../cfg
+    - file://${oc.env:OMNI_DRONES_HYDRA_SEARCHPATH}
 
 headless: true
 

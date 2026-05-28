@@ -1,0 +1,35 @@
+name: AmovHover
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 64  # 先用较少环境测试，成功后可增加到128-256
+  env_spacing: 8  # AMOV无人机更大，增加间距
+
+drone_model:
+  name: AmovDrone
+  controller: LeePositionController
+
+time_encoding: true
+
+# 针对重型无人机（10kg）调整的超参数
+# 关键原则：
+# 1. 降低距离敏感度（重型机响应慢）
+# 2. 降低能量惩罚（重型机需要更大推力）
+# 3. 增加平滑性奖励（避免剧烈震荡）
+
+reward_effort_weight: 0.01  # 从0.1降到0.01（降低能量惩罚）
+reward_action_smoothness_weight: 0.05  # 从0.0增到0.05（增加平滑性）
+reward_motion_smoothness_weight: 0.0
+reward_distance_scale: 0.5  # 从1.2降到0.5（降低距离敏感度）
+
+action_transform: null
+
+# 可选：添加随机化以提高鲁棒性
+# randomization:
+#   drone:
+#     mass: [0.9, 1.1]  # ±10%质量变化
+#     inertia: [0.9, 1.1]

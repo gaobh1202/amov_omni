@@ -13,6 +13,11 @@ drone_model:
   name: Firefly
   controller: LeePositionController
 
+# 悬停目标可视化：默认与无人机同类 USD（如火萤外形）。设为 false 仅用小立方体标记目标。
+hover_target:
+  use_drone_visual: true
+  usd_path: null
+
 time_encoding: true
 
 reward_effort_weight: 0.1

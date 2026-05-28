@@ -1,5 +1,12 @@
 import logging
 import os
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+os.environ.setdefault(
+    "OMNI_DRONES_HYDRA_SEARCHPATH",
+    str(_REPO_ROOT / "cfg"),
+)
 
 import hydra
 import torch

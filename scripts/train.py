@@ -1,6 +1,20 @@
+'''
+python scripts/train.py algo=ppo headless=false \
+  wandb.entity=benhua_g-the-hong-kong-polytechnic-university \
+  wandb.project=omnidrone \
+  task=HoverAmov
+'''
 import logging
 import os
 import time
+from pathlib import Path
+
+# Hydra 中 file://../cfg 会随当前工作目录变化；从仓库根目录执行 python scripts/train.py 时会失效。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+os.environ.setdefault(
+    "OMNI_DRONES_HYDRA_SEARCHPATH",
+    str(_REPO_ROOT / "cfg"),
+)
 
 import hydra
 import torch
@@ -32,6 +46,121 @@ from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 
+def _run_preflight(base_env, cfg) -> None:
+    preflight_cfg = cfg.task.get("preflight", None)
+    if not preflight_cfg or not preflight_cfg.get("enabled", False):
+        return
+
+    drone = base_env.drone
+    gravity = drone.gravity.reshape(-1).float()
+    kf = drone.KF.reshape(-1, drone.num_rotors).float()[0]
+    total_max_thrust = float(kf.sum().item())
+    gravity_force = float(gravity[0].item())
+    t2w = total_max_thrust / max(gravity_force, 1e-9)
+    hover_t = gravity_force / max(total_max_thrust, 1e-9)
+    rotor_view_count = int(getattr(drone.rotors_view, "count", 0))
+    expected_rotor_count = int(base_env.num_envs * drone.num_rotors)
+    articulation_rel = getattr(drone, "_amov_articulation_rel", None)
+
+    checks = []
+    checks.append(("thrust_to_weight", t2w, "FAIL" if t2w < 1.2 else ("WARN" if t2w < 1.8 else "PASS")))
+    checks.append(("hover_ratio_t", hover_t, "FAIL" if not (0.0 < hover_t < 1.0) else ("WARN" if hover_t > 0.75 else "PASS")))
+    checks.append((
+        "rotor_prim_binding",
+        f"{rotor_view_count}/{expected_rotor_count}",
+        "FAIL" if rotor_view_count != expected_rotor_count else "PASS",
+    ))
+    checks.append((
+        "articulation_binding",
+        articulation_rel if articulation_rel else "missing",
+        "FAIL" if articulation_rel in (None, "") else "PASS",
+    ))
+
+    logging.info("Preflight checks for %s", cfg.task.drone_model.name)
+    fail_count = 0
+    warn_count = 0
+    for name, value, status in checks:
+        logging.info("Preflight %-22s [%s] value=%s", name, status, value)
+        if status == "FAIL":
+            fail_count += 1
+        elif status == "WARN":
+            warn_count += 1
+
+    if fail_count:
+        raise RuntimeError(
+            "Preflight failed with model-level issues. "
+            "Run `python test_amov_thrust.py --task HoverAmov` for full diagnostics."
+        )
+    if warn_count:
+        logging.warning("Preflight completed with %d warning(s).", warn_count)
+    else:
+        logging.info("Preflight passed without warnings.")
+
+
+_THRUST_PRINT_COUNTER = 0
+_THRUST_PRINT_INTERVAL = 50  # print every N policy updates
+
+def _collect_thrust_metrics(base_env):
+    global _THRUST_PRINT_COUNTER
+    drone = getattr(base_env, "drone", None)
+    if drone is None or not all(hasattr(drone, k) for k in ("thrusts", "KF", "gravity")):
+        return {}
+
+    # thrusts shape: (..., num_rotors, 3), z-axis stores per-rotor thrust scalar.
+    thrust_z = drone.thrusts[..., 2]
+    mean_total_thrust = thrust_z.sum(dim=-1).mean()
+    max_total_thrust = drone.KF.sum(dim=-1).mean().clamp_min(1e-9)
+    hover_force = drone.gravity.mean().clamp_min(1e-9)
+
+    # Per-rotor throttle (0-1) and corresponding angular velocity (rad/s)
+    mean_throttle = drone.throttle.mean().item()
+    per_rotor_throttle = drone.throttle.reshape(-1, drone.num_rotors).mean(0)  # (num_rotors,)
+    # angular velocity: throttle * MAX_ROT_VEL (rad/s)
+    if hasattr(drone, "rotors") and hasattr(drone.rotors, "KF"):
+        # MAX_ROT_VEL stored implicitly; derive from KF = max_omega^2 * force_constant
+        # use drone.KF_0 and rotor config if available
+        max_omega = getattr(drone, "_max_rot_vel", None)
+        if max_omega is None and hasattr(drone, "KF_0") and hasattr(drone, "rotors"):
+            # KF = omega_max^2 * kf_coef → omega_max = sqrt(KF / kf_coef) but we can't easily get kf_coef
+            # fallback: just report throttle
+            max_omega = None
+    else:
+        max_omega = None
+
+    metrics = {
+        "train/mean_thrust_n": mean_total_thrust.item(),
+        "train/max_thrust_ratio": (mean_total_thrust / max_total_thrust).item(),
+        "train/hover_ratio": (mean_total_thrust / hover_force).item(),
+        "train/mean_throttle": mean_throttle,
+    }
+
+    # hover_cmd normalization params from env if available
+    hover_cmd_offset = getattr(base_env, "_hover_cmd_offset", None)
+    if hover_cmd_offset is not None:
+        metrics["train/hover_cmd_offset"] = hover_cmd_offset
+    hover_cmd_scale = getattr(base_env, "_hover_cmd_scale", None)
+    if hover_cmd_scale is not None:
+        metrics["train/hover_cmd_scale"] = hover_cmd_scale
+
+    # Periodic console print for quick inspection
+    _THRUST_PRINT_COUNTER += 1
+    if _THRUST_PRINT_COUNTER % _THRUST_PRINT_INTERVAL == 0:
+        thr_per_rotor_str = ", ".join(f"{v:.3f}" for v in per_rotor_throttle.tolist())
+        thrust_per_rotor = (per_rotor_throttle ** 2) * drone.KF.reshape(-1, drone.num_rotors).mean(0)
+        thrust_per_rotor_str = ", ".join(f"{v:.1f}N" for v in thrust_per_rotor.tolist())
+        logging.info(
+            "[Thrust] total=%.1fN  hover=%.1fN  ratio=%.2f  "
+            "throttle/rotor=[%s]  thrust/rotor=[%s]",
+            mean_total_thrust.item(),
+            hover_force.item(),
+            (mean_total_thrust / hover_force).item(),
+            thr_per_rotor_str,
+            thrust_per_rotor_str,
+        )
+
+    return metrics
+
+
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
@@ -46,6 +175,7 @@ def main(cfg):
 
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
     base_env = env_class(cfg, headless=cfg.headless)
+    _run_preflight(base_env, cfg)
 
     transforms = [InitTracker()]
 
@@ -168,6 +298,7 @@ def main(cfg):
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())
+        info.update(_collect_thrust_metrics(base_env))
 
         if len(episode_stats) >= base_env.num_envs:
             stats = {
@@ -186,9 +317,9 @@ def main(cfg):
 
         if save_interval > 0 and i % save_interval == 0:
             try:
-                ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
+                ckpt_path = os.path.join(run.dir, "checkpoint_latest.pt")
                 torch.save(policy.state_dict(), ckpt_path)
-                logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+                logging.info(f"Saved checkpoint to {str(ckpt_path)} (frames={collector._frames})")
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 

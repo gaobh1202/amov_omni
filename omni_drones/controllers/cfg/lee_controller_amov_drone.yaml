@@ -1,0 +1,5 @@
+# Lee position controller — Amov (~10 kg quad). Tune if hover is sluggish or oscillatory.
+position_gain: [9, 9, 18]
+velocity_gain: [6.5, 6.5, 11]
+attitude_gain: [4.5, 4.5, 2.2]
+angular_rate_gain: [0.75, 0.75, 0.75]

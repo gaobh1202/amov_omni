@@ -134,10 +134,10 @@ class RobotBase(abc.ABC):
                 disable_gravity=self.rigid_props.disable_gravity,
                 retain_accelerations=self.rigid_props.retain_accelerations,
             )
-            # articulation root settings
+            # articulation root settings（部分 URDF 导入机体关节根不在 spawn 根 prim 上，见 _articulation_properties_prim_path）
             if self.is_articulation:
                 kit_utils.set_articulation_properties(
-                    prim_path,
+                    self._articulation_properties_prim_path(prim_path),
                     enable_self_collisions=self.articulation_props.enable_self_collisions,
                     solver_position_iteration_count=self.articulation_props.solver_position_iteration_count,
                     solver_velocity_iteration_count=self.articulation_props.solver_velocity_iteration_count,
@@ -146,6 +146,10 @@ class RobotBase(abc.ABC):
 
         self.n += n
         return prims
+
+    def _articulation_properties_prim_path(self, spawn_root_prim_path: str) -> str:
+        """``set_articulation_properties`` 作用的 prim。默认即 spawn 根；URDF 导入机体可覆盖为子路径。"""
+        return spawn_root_prim_path
 
     def _create_prim(self, prim_path, translation, orientation):
         prim = prim_utils.create_prim(

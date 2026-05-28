@@ -1,8 +1,8 @@
 # hydra.job.chdir: false
 hydra:
   searchpath:
-    # see https://hydra.cc/docs/advanced/search_path/
-    - file://../cfg
+    # 绝对路径由 train.py 根据 __file__ 写入 OMNI_DRONES_HYDRA_SEARCHPATH（避免从仓库根目录运行时 ../cfg 解析错误）
+    - file://${oc.env:OMNI_DRONES_HYDRA_SEARCHPATH}
 
 headless: true
 

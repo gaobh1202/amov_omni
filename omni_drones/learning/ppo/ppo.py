@@ -54,6 +54,12 @@ class PPOConfig:
 
     checkpoint_path: Union[str, None] = None
 
+    # Initial log-std for the actor Gaussian.
+    # Default 0.0 → std=1.0 (wide exploration).
+    # Set to -1.0 → std≈0.37 for drones where large per-rotor variance
+    # causes destabilizing torques early in training (e.g. heavy quadrotors).
+    actor_log_std_init: float = 0.0
+
 cs = ConfigStore.instance()
 cs.store("ppo", node=PPOConfig, group="algo")
 cs.store("ppo_priv", node=PPOConfig(priv_actor=True, priv_critic=True), group="algo")
@@ -70,18 +76,49 @@ def make_mlp(num_units):
 
 
 class Actor(nn.Module):
-    def __init__(self, action_dim: int) -> None:
+    def __init__(self, action_dim: int, log_std_init: float = 0.0) -> None:
         super().__init__()
         self.actor_mean = nn.LazyLinear(action_dim)
-        self.actor_std = nn.Parameter(torch.zeros(action_dim))
+        self.actor_std = nn.Parameter(torch.full((action_dim,), log_std_init))
+        self._mean_zero_init_done = False
 
     def forward(self, features: torch.Tensor):
+        # On the very first forward pass, zero-init the output layer so that
+        # actor_mean(obs) = 0 for any observation.  Combined with the
+        # hover_cmd_offset applied in the env, action=0 maps exactly to hover
+        # thrust, giving a neutral starting point that prevents systematic
+        # thrust deficit early in training.
+        if not self._mean_zero_init_done:
+            with torch.no_grad():
+                self.actor_mean(features)          # materialise LazyLinear
+                nn.init.zeros_(self.actor_mean.weight)
+                nn.init.zeros_(self.actor_mean.bias)
+            self._mean_zero_init_done = True
         loc = self.actor_mean(features)
-        scale = torch.exp(self.actor_std).expand_as(loc)
+        scale = torch.exp(self.actor_std.clamp(-5.0, 2.0)).expand_as(loc)
         return loc, scale
 
 
 class PPOPolicy(TensorDictModuleBase):
+
+    @staticmethod
+    def _is_finite(*tensors: torch.Tensor) -> bool:
+        return all(torch.isfinite(t).all() for t in tensors)
+
+    @staticmethod
+    def _zero_info(device) -> TensorDict:
+        z = torch.zeros((), device=device)
+        return TensorDict(
+            {
+                "policy_loss": z,
+                "value_loss": z,
+                "entropy": z,
+                "actor_grad_norm": z,
+                "critic_grad_norm": z,
+                "explained_var": z,
+            },
+            [],
+        )
 
     def __init__(
         self,
@@ -113,13 +150,13 @@ class PPOPolicy(TensorDictModuleBase):
                 ),
                 CatTensors(["feature", "context"], "feature"),
                 TensorDictModule(
-                    nn.Sequential(make_mlp([256, 256]), Actor(self.action_dim)),
+                    nn.Sequential(make_mlp([256, 256]), Actor(self.action_dim, cfg.actor_log_std_init)),
                     ["feature"], ["loc", "scale"]
                 )
             )
         else:
             actor_module=TensorDictModule(
-                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim)),
+                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim, cfg.actor_log_std_init)),
                 [("agents", "observation")], ["loc", "scale"]
             )
         self.actor: ProbabilisticActor = ProbabilisticActor(
@@ -179,22 +216,30 @@ class PPOPolicy(TensorDictModuleBase):
         next_tensordict = tensordict["next"]
         with torch.no_grad():
             next_values = self.critic(next_tensordict)["state_value"]
-        rewards = tensordict[("next", "agents", "reward")]
+        rewards = torch.nan_to_num(
+            tensordict[("next", "agents", "reward")], nan=0.0, posinf=0.0, neginf=0.0
+        )
         dones = einops.repeat(
             tensordict[("next", "terminated")],
             "t e 1 -> t e a 1",
             a=self.n_agents
         )
-        values = tensordict["state_value"]
-        values = self.value_norm.denormalize(values)
+        dones = torch.nan_to_num(dones.float(), nan=1.0, posinf=1.0, neginf=1.0).bool()
+        values = self.value_norm.denormalize(tensordict["state_value"])
         next_values = self.value_norm.denormalize(next_values)
+        values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        next_values = torch.nan_to_num(next_values, nan=0.0, posinf=0.0, neginf=0.0)
 
         adv, ret = self.gae(rewards, dones, values, next_values)
+        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+        ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
         adv_mean = adv.mean()
-        adv_std = adv.std()
-        adv = (adv - adv_mean) / adv_std.clip(1e-7)
+        adv_std = adv.std().clamp_min(1e-6)
+        adv = (adv - adv_mean) / adv_std
+        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
         self.value_norm.update(ret)
         ret = self.value_norm.normalize(ret)
+        ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
 
         tensordict.set("adv", adv)
         tensordict.set("ret", ret)
@@ -215,6 +260,10 @@ class PPOPolicy(TensorDictModuleBase):
         entropy = dist.entropy()
 
         adv = tensordict["adv"]
+        if not self._is_finite(
+            log_probs, entropy, adv, tensordict["sample_log_prob"], tensordict["ret"]
+        ):
+            return self._zero_info(log_probs.device)
         ratio = torch.exp(log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
         surr1 = adv * ratio
         surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
@@ -232,6 +281,8 @@ class PPOPolicy(TensorDictModuleBase):
         value_loss = torch.max(value_loss_original, value_loss_clipped)
 
         loss = policy_loss + entropy_loss + value_loss
+        if not torch.isfinite(loss):
+            return self._zero_info(loss.device)
         self.actor_opt.zero_grad()
         self.critic_opt.zero_grad()
         loss.backward()
@@ -239,7 +290,13 @@ class PPOPolicy(TensorDictModuleBase):
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), 5)
         self.actor_opt.step()
         self.critic_opt.step()
-        explained_var = 1 - F.mse_loss(values, b_returns) / b_returns.var()
+        explained_var = 1 - F.mse_loss(values, b_returns) / b_returns.var().clamp_min(1e-6)
+        actor_grad_norm = torch.nan_to_num(actor_grad_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        critic_grad_norm = torch.nan_to_num(critic_grad_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+        policy_loss = torch.nan_to_num(policy_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        value_loss = torch.nan_to_num(value_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        explained_var = torch.nan_to_num(explained_var, nan=0.0, posinf=0.0, neginf=0.0)
         return TensorDict({
             "policy_loss": policy_loss,
             "value_loss": value_loss,

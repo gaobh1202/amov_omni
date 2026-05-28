@@ -1,0 +1,181 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.2"
+    }
+    defaultPrim = "amov_drone"
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "amov_drone"
+{
+    def Scope "Physics"
+    {
+        def PhysicsFixedJoint "root_joint"
+        {
+            rel physics:body0 = </amov_drone>
+            rel physics:body1 = </amov_drone/Geometry/base_link>
+            point3f physics:localPos0 = (0, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsRevoluteJoint "rotor_joint_1"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </amov_drone/Geometry/base_link>
+            rel physics:body1 = </amov_drone/Geometry/base_link/rotor_link_1>
+            point3f physics:localPos0 = (-0.34885, 0.32633, 0.043581)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -57.29578
+            float physics:upperLimit = 57.29578
+            custom float urdf:limit:effort = 0
+            custom float urdf:limit:velocity = 0
+        }
+
+        def PhysicsRevoluteJoint "rotor_joint_2"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </amov_drone/Geometry/base_link>
+            rel physics:body1 = </amov_drone/Geometry/base_link/rotor_link_2>
+            point3f physics:localPos0 = (0.32289, 0.32633, 0.043581)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -57.29578
+            float physics:upperLimit = 57.29578
+            custom float urdf:limit:effort = 0
+            custom float urdf:limit:velocity = 0
+        }
+
+        def PhysicsRevoluteJoint "rotor_joint_3"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </amov_drone/Geometry/base_link>
+            rel physics:body1 = </amov_drone/Geometry/base_link/rotor_link_3>
+            point3f physics:localPos0 = (0.32289, -0.34542, 0.043581)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -57.29578
+            float physics:upperLimit = 57.29578
+            custom float urdf:limit:effort = 0
+            custom float urdf:limit:velocity = 0
+        }
+
+        def PhysicsRevoluteJoint "rotor_joint_4"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </amov_drone/Geometry/base_link>
+            rel physics:body1 = </amov_drone/Geometry/base_link/rotor_link_4>
+            point3f physics:localPos0 = (-0.34885, -0.34542, 0.043581)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -57.29578
+            float physics:upperLimit = 57.29578
+            custom float urdf:limit:effort = 0
+            custom float urdf:limit:velocity = 0
+        }
+    }
+
+    over "Geometry"
+    {
+        over "base_link" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsArticulationRootAPI", "NewtonArticulationRootAPI", "PhysicsMassAPI"]
+        )
+        {
+            point3f physics:centerOfMass = (-0.012971, -0.0095367, -0.0058254)
+            float3 physics:diagonalInertia = (0.057066992, 0.06450301, 0.10188)
+            float physics:mass = 9.8519
+            quatf physics:principalAxes = (0.9999999, 8.6707266e-14, 3.511412e-13, -0.00050454476)
+
+            over "base_link_1" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+
+            over "rotor_link_1" (
+                prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+            )
+            {
+                point3f physics:centerOfMass = (9.8797855e-8, -3.1138077e-7, 0.015149421)
+                float3 physics:diagonalInertia = (0.000015316487, 0.002572648, 0.0025854849)
+                float physics:mass = 0.11978745
+                quatf physics:principalAxes = (0.0000036221911, 0.7222967, 0.6915833, -0.0000035521807)
+
+                over "rotor_link_1_1" (
+                    prepend apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+                )
+                {
+                    uniform token physics:approximation = "convexHull"
+                }
+            }
+
+            over "rotor_link_2" (
+                prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+            )
+            {
+                point3f physics:centerOfMass = (8.968625e-8, -1.6990636e-7, 0.015149423)
+                float3 physics:diagonalInertia = (0.000015316515, 0.0025726503, 0.0025854872)
+                float physics:mass = 0.11978764
+                quatf physics:principalAxes = (0.0000037065697, 0.7222967, 0.69158334, -0.0000036254314)
+
+                over "rotor_link_2_1" (
+                    prepend apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+                )
+                {
+                    uniform token physics:approximation = "convexHull"
+                }
+            }
+
+            over "rotor_link_3" (
+                prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+            )
+            {
+                point3f physics:centerOfMass = (8.9758004e-8, -1.6939053e-7, 0.015149419)
+                float3 physics:diagonalInertia = (0.000015316462, 0.0025726454, 0.0025854823)
+                float physics:mass = 0.119787306
+                quatf physics:principalAxes = (0.0000037071898, 0.7222968, 0.6915833, -0.0000036260246)
+
+                over "rotor_link_3_1" (
+                    prepend apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+                )
+                {
+                    uniform token physics:approximation = "convexHull"
+                }
+            }
+
+            over "rotor_link_4" (
+                prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+            )
+            {
+                point3f physics:centerOfMass = (0, 0, 0)
+                float3 physics:diagonalInertia = (0, 0, 0)
+                float physics:mass = 0
+                quatf physics:principalAxes = (1, 0, 0, 0)
+
+                over "rotor_link_4_1" (
+                    prepend apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+                )
+                {
+                    uniform token physics:approximation = "convexHull"
+                }
+            }
+        }
+    }
+}
+
+def PhysicsScene "PhysicsScene" (
+    prepend apiSchemas = ["NewtonSceneAPI"]
+)
+{
+}
+

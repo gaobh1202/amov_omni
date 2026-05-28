@@ -244,7 +244,11 @@ class ArticulationView(_ArticulationView):
             return None
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+        *args,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         if self._physics_view is not None:
@@ -263,6 +267,7 @@ class ArticulationView(_ArticulationView):
         positions: Optional[torch.Tensor] = None,
         orientations: Optional[torch.Tensor] = None,
         env_indices: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> None:
         with disable_warnings(self._physics_sim_view):
             indices = self._resolve_env_indices(env_indices)
@@ -387,6 +392,160 @@ class ArticulationView(_ArticulationView):
         indices = self._resolve_env_indices(env_indices)
         return super().set_body_masses(values.reshape(-1, self.num_bodies), indices)
 
+    def _root_body_indices_tensor(self) -> torch.Tensor:
+        return torch.tensor([0], device=self._device, dtype=torch.long)
+
+    def get_masses(
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+    ) -> torch.Tensor:
+        """Root link mass; shape matches ``RigidPrimView.get_masses`` (…, 1)."""
+        indices = self._resolve_env_indices(env_indices)
+        root_bodies = self._root_body_indices_tensor()
+        m = super().get_body_masses(indices, body_indices=root_bodies, clone=clone)
+        return m.reshape(-1, *self.shape[1:], 1)
+
+    def set_masses(
+        self,
+        masses: torch.Tensor,
+        env_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        indices = self._resolve_env_indices(env_indices).cpu()
+        masses = masses.reshape(-1, 1)
+        super().set_body_masses(
+            masses,
+            indices=indices,
+            body_indices=self._root_body_indices_tensor(),
+        )
+
+    def get_inertias(
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+    ) -> torch.Tensor:
+        """Root link inertia 3×3 row-major flattened; shape (…, 9) like ``RigidPrimView``."""
+        indices = self._resolve_env_indices(env_indices)
+        root_bodies = self._root_body_indices_tensor()
+        inh = super().get_body_inertias(indices, body_indices=root_bodies, clone=clone)
+        inh = inh.squeeze(1)
+        return inh.unflatten(0, self.shape)
+
+    def set_inertias(
+        self,
+        values: torch.Tensor,
+        env_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        indices = self._resolve_env_indices(env_indices).cpu()
+        v = values.reshape(-1, 1, 9)
+        super().set_body_inertias(
+            v,
+            indices=indices,
+            body_indices=self._root_body_indices_tensor(),
+        )
+
+    def get_coms(
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+    ) -> tuple:
+        """Root link COM position in world frame; shape matches RigidPrimView.get_coms (…, 3).
+
+        Falls back to prim-origin from get_world_poses() if the underlying
+        ArticulationView does not implement get_body_coms (older Isaac Sim versions).
+        """
+        indices = self._resolve_env_indices(env_indices)
+        root_bodies = self._root_body_indices_tensor()
+        try:
+            positions, orientations = super().get_body_coms(
+                indices, body_indices=root_bodies, clone=clone
+            )
+            # positions shape from parent: (M, 1, 3) → squeeze dim-1 → (M, 3) → (*shape, 3)
+            pos = positions.squeeze(-2).unflatten(0, self.shape)
+            ori = orientations.squeeze(-2).unflatten(0, self.shape)
+            return pos, ori
+        except (AttributeError, NotImplementedError):
+            return self.get_world_poses(env_indices=env_indices, clone=clone)
+
+    def set_coms(
+        self,
+        positions: torch.Tensor = None,
+        env_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        indices = self._resolve_env_indices(env_indices).cpu()
+        pos = positions.reshape(-1, 1, 3)
+        super().set_body_coms(
+            positions=pos,
+            orientations=None,
+            indices=indices,
+            body_indices=self._root_body_indices_tensor(),
+        )
+
+    def apply_forces_and_torques_at_pos(
+        self,
+        forces: Optional[Union[np.ndarray, List, torch.Tensor]] = None,
+        torques: Optional[Union[np.ndarray, List, torch.Tensor]] = None,
+        positions: Optional[Union[np.ndarray, List, torch.Tensor]] = None,
+        indices: Optional[Union[np.ndarray, List, torch.Tensor]] = None,
+        is_global: bool = True,
+    ) -> None:
+        """在 articulation **根连杆**上施加外力/外矩；调用方式与 ``RigidPrimView`` 一致。
+
+        PhysX articulation 的 ``apply_forces_and_torques_at_position`` 要求
+        ``force_data`` / ``torque_data`` 长度为 ``count * num_bodies``（逐 link 展平），
+        不能像刚体视图那样使用 ``(count, 3)``。此处将传入的 ``(M, 3)`` 写入根连杆行
+        ``articulation_index * num_bodies + root_body_index``，其余 link 为 0。
+        """
+        if omni.timeline.get_timeline_interface().is_stopped() or self._physics_view is None:
+            carb.log_warn(
+                "Physics Simulation View is not created yet in order to use apply_forces_and_torques_at_pos"
+            )
+            return
+        if forces is None and torques is None:
+            return
+
+        indices = self._backend_utils.resolve_indices(indices, self.count, self._device)
+        L = self.num_bodies
+        root = int(self._root_body_indices_tensor()[0].item())
+        buf_rows = self.count * L
+        flat = indices.long() * L + root
+
+        new_forces = new_torques = new_positions = None
+
+        if forces is not None:
+            f = self._backend_utils.move_data(forces, self._device).reshape(-1, 3)
+            if f.shape[0] != indices.shape[0]:
+                raise ValueError(
+                    f"forces leading dim {f.shape[0]} != num selected articulations {indices.shape[0]}"
+                )
+            new_forces = torch.zeros((buf_rows, 3), device=self._device, dtype=torch.float32)
+            new_forces[flat] = f.to(dtype=torch.float32)
+            if positions is not None:
+                p = self._backend_utils.move_data(positions, self._device).reshape(-1, 3)
+                if p.shape[0] != indices.shape[0]:
+                    raise ValueError(
+                        f"positions leading dim {p.shape[0]} != num selected articulations {indices.shape[0]}"
+                    )
+                new_positions = torch.zeros((buf_rows, 3), device=self._device, dtype=torch.float32)
+                new_positions[flat] = p.to(dtype=torch.float32)
+
+        if torques is not None:
+            t = self._backend_utils.move_data(torques, self._device).reshape(-1, 3)
+            if t.shape[0] != indices.shape[0]:
+                raise ValueError(
+                    f"torques leading dim {t.shape[0]} != num selected articulations {indices.shape[0]}"
+                )
+            new_torques = torch.zeros((buf_rows, 3), device=self._device, dtype=torch.float32)
+            new_torques[flat] = t.to(dtype=torch.float32)
+
+        self._physics_view.apply_forces_and_torques_at_position(
+            force_data=new_forces,
+            torque_data=new_torques,
+            position_data=new_positions,
+            indices=indices,
+            is_global=is_global,
+        )
+
     def get_force_sensor_forces(self, env_indices: Optional[torch.Tensor] = None, clone: bool = False) -> torch.Tensor:
         with disable_warnings(self._physics_sim_view):
             forces = torch.unflatten(self._physics_view.get_force_sensor_forces(), 0, self.shape)
@@ -459,7 +618,11 @@ class RigidPrimView(_RigidPrimView):
         return self
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self,
+        env_indices: Optional[torch.Tensor] = None,
+        clone: bool = True,
+        *args,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         pos, rot = super().get_world_poses(indices, clone)
@@ -470,9 +633,29 @@ class RigidPrimView(_RigidPrimView):
         positions: Optional[torch.Tensor] = None,
         orientations: Optional[torch.Tensor] = None,
         env_indices: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> None:
-        with disable_warnings(self._physics_sim_view):
-            indices = self._resolve_env_indices(env_indices)
+        indices = self._resolve_env_indices(env_indices)
+        # articulation 根上的 RigidPrimView 会在 __init__ 里调 _set_xform_properties → set_world_poses，
+        # 此时尚未 initialize()，没有 _physics_sim_view / 有效 _physics_view；须走父类 USD 路径。
+        sim_view = getattr(self, "_physics_sim_view", None)
+        if (
+            omni.timeline.get_timeline_interface().is_stopped()
+            or self._physics_view is None
+            or sim_view is None
+        ):
+            pos, ori = positions, orientations
+            if pos is not None:
+                pos = pos.reshape(-1, 3)
+            if ori is not None:
+                ori = ori.reshape(-1, 4)
+            return super().set_world_poses(
+                positions=pos,
+                orientations=ori,
+                indices=indices,
+                **kwargs,
+            )
+        with disable_warnings(sim_view):
             poses = self._physics_view.get_transforms()
             if positions is not None:
                 poses[indices, :3] = positions.reshape(-1, 3)

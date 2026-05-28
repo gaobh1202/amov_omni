@@ -1,0 +1,43 @@
+name: amov_drone_arm_0
+inertia:
+  xx: 0.395166
+  xy: 0.0
+  xz: 0.0
+  yy: 0.530486
+  yz: 0.0
+  zz: 0.205575
+mass: 13.332051
+l: 0.475
+drag_coef: 0.3
+rotor_configuration:
+  arm_lengths:
+    - 0.477753
+    - 0.459035
+    - 0.472779
+    - 0.490881
+  directions:
+    - -1.0
+    - 1.0
+    - -1.0
+    - 1.0
+  force_constants:
+    - 5.155573e-04
+    - 5.155573e-04
+    - 5.155573e-04
+    - 5.155573e-04
+  max_rotation_velocities:
+    - 436.20
+    - 436.20
+    - 436.20
+    - 436.20
+  moment_constants:
+    - 7.733359e-06
+    - 7.733359e-06
+    - 7.733359e-06
+    - 7.733359e-06
+  num_rotors: 4
+  rotor_angles:
+    - 2.389456
+    - 0.790759
+    - -0.81933
+    - -2.36116

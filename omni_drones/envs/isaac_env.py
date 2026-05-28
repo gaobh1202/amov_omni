@@ -183,8 +183,6 @@ class IsaacEnv(EnvBase):
             "truncated": DiscreteTensorSpec(2, (1,), dtype=torch.bool),
         }).expand(self.num_envs).to(self.device)
         self._set_specs()
-        import pprint
-        pprint.pprint(self.fake_tensordict().shapes)
 
 
     @classmethod

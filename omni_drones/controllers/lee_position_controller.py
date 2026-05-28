@@ -83,9 +83,21 @@ class LeePositionController(ControllerBase):
         uav_params,
     ) -> None:
         super().__init__()
-        controller_param_path = osp.join(
-            osp.dirname(__file__), "cfg", f"lee_controller_{uav_params['name']}.yaml"
-        )
+        cfg_dir = osp.join(osp.dirname(__file__), "cfg")
+        uav_name = uav_params["name"]
+        controller_param_path = osp.join(cfg_dir, f"lee_controller_{uav_name}.yaml")
+        if not osp.exists(controller_param_path):
+            # Backward-compatible fallback for derivative AMOV names, e.g. amov_drone_arm_0.
+            fallback_names = []
+            if str(uav_name).startswith("amov_drone"):
+                fallback_names.append("amov_drone")
+            fallback_names.append(str(uav_name).split("_arm_")[0])
+            fallback_names = [n for n in dict.fromkeys(fallback_names) if n]
+            for name in fallback_names:
+                candidate = osp.join(cfg_dir, f"lee_controller_{name}.yaml")
+                if osp.exists(candidate):
+                    controller_param_path = candidate
+                    break
         with open(controller_param_path, "r") as f:
             controller_params = yaml.safe_load(f)
 

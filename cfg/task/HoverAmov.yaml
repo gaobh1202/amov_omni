@@ -1,0 +1,74 @@
+# 与 Hover 相同的环境与奖励，仅将无人机模型换为 AmovDrone。
+# 运行示例: python train.py task=HoverAmov algo=ppo
+name: Hover
+
+defaults:
+  - Hover
+  - _self_
+
+env:
+  num_envs: 128  # 先和 Firefly Hover baseline 对齐
+  env_spacing: 8  # 机体更大，保持更宽间距避免相邻干扰
+
+drone_model:
+  name: AmovDrone
+  controller: LeePositionController
+
+time_encoding: true
+
+reward_effort_weight: 0.0
+reward_action_smoothness_weight: 0.0
+reward_motion_smoothness_weight: 0.0
+reward_distance_scale: 1.2
+# Standalone uprightness reward (not gated by pose distance).
+# Provides a direct gradient to stay upright from episode 1.
+reward_up_weight: 0.5
+# 0.45m: high enough to catch the drone before it bounces off the ground plane
+# (which happens at ~0.1-0.2m COM height), but low enough that episodes are
+# not cut short when the drone is generating near-hover thrust.
+ground_reset_height: 0.45
+# Relaxed from 0.2 to -0.2: allow moderate tilting without terminating immediately.
+# The main instability cause (wrong torque reference) is now fixed; with correct
+# physics, the drone should not flip.  A looser threshold gives more episode
+# length for learning in case of residual instability.
+min_up_z: -0.2
+
+# Narrow initial roll/pitch disturbance for heavy articulated AMOV.
+init_rpy_range:
+  low: [-0.03, -0.03, 0.0]
+  high: [0.03, 0.03, 2.0]
+
+# Start drone within ±1.5m of target in X/Y and z=1.0~2.5m.
+# Narrower than default ±2.5m so the pose reward is strong enough
+# to teach the policy to approach the target early in training.
+init_pos_range:
+  low: [-1.5, -1.5, 1.2]
+  high: [1.5, 1.5, 2.5]
+
+action_transform: null
+
+preflight:
+  enabled: false
+
+# 避免再引用 firefly.usd 作为目标机外形，场景中只保留 Amov 整机模型。
+hover_target:
+  use_drone_visual: false
+  usd_path: null
+
+# 机械臂运动配置
+# active_joint: 0 = 第一个非旋翼关节（通常是 joint1，底座旋转）
+# amplitude: 峰值角度（弧度），joint1 范围约 ±1.5 rad
+# frequency: 往复频率（Hz），0.5 Hz = 2 秒一个来回
+arm_motion:
+  enabled: false
+  active_joint: 0
+  amplitude: 0.3
+  frequency: 0.5
+
+# 固定机械臂关节（不参与 PPO）。若 joint_positions 长度不足，会自动用 0 补齐。
+# 典型顺序：joint1..joint6, endleft, endright
+arm_hold:
+  enabled: true
+  joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  zero_velocity_each_step: true
+

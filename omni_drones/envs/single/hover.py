@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
+import logging
 import torch
 import torch.distributions as D
 
@@ -109,18 +109,83 @@ class Hover(IsaacEnv):
     | `reward_distance_scale` | float | 1.2       | Scales the reward based on the distance between the drone and its target.                                                                                                                                                               |
     | `time_encoding`         | bool  | True      | Indicates whether to include time encoding in the observation space. If set to True, a 4-dimensional vector encoding the current progress of the episode is included in the observation. If set to False, this feature is not included. |
     | `has_payload`           | bool  | False     | Indicates whether the drone has a payload attached. If set to True, it means that a payload is attached; otherwise, if set to False, no payload is attached.                                                                            |
+    | `hover_target.use_drone_visual` | bool | True | If True (default), spawn the hover goal marker from ``hover_target_usd_path`` / drone USD (e.g. Firefly-shaped ghost). If False, spawn a small cube instead so only the task drone appears as a full model. |
+    | `hover_target.usd_path` | str or null | null | Optional USD path for the goal marker. When set, overrides ``use_drone_visual`` / drone defaults. |
     """
     def __init__(self, cfg, headless):
         self.reward_effort_weight = cfg.task.reward_effort_weight
         self.reward_action_smoothness_weight = cfg.task.reward_action_smoothness_weight
         self.reward_distance_scale = cfg.task.reward_distance_scale
+        self.reward_up_weight = float(cfg.task.get("reward_up_weight", 0.5))
         self.time_encoding = cfg.task.time_encoding
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
+        self.ground_reset_height = float(cfg.task.get("ground_reset_height", 0.2))
+        self.min_up_z = float(cfg.task.get("min_up_z", -1.0))
+
+        ht = cfg.task.get("hover_target")
+        if ht is None:
+            self._hover_target_use_drone_visual = True
+            self._hover_target_usd_override = None
+        else:
+            self._hover_target_use_drone_visual = getattr(ht, "use_drone_visual", True)
+            o = getattr(ht, "usd_path", None)
+            self._hover_target_usd_override = o if o not in (None, "") else None
+        self._hover_simple_target_marker = (
+            self._hover_target_usd_override is None and not self._hover_target_use_drone_visual
+        )
 
         super().__init__(cfg, headless)
 
         self.drone.initialize()
+
+        # Arm control setup (for robots with extra arm joints, e.g. AmovDrone).
+        self._arm_motion_enabled = False
+        self._arm_hold_enabled = False
+        self._arm_hold_targets = None
+        self._arm_hold_zero_velocity_each_step = False
+        _has_arm_joints = (
+            hasattr(self.drone, "arm_joint_indices")
+            and self.drone.arm_joint_indices is not None
+        )
+
+        _arm_hold_cfg = cfg.task.get("arm_hold", None)
+        _arm_hold_requested = (
+            _arm_hold_cfg is not None and _arm_hold_cfg.get("enabled", False)
+        )
+        if _arm_hold_requested and not _has_arm_joints:
+            logging.warning("arm_hold is enabled but this drone has no arm joints.")
+        elif _arm_hold_requested:
+            raw_targets = _arm_hold_cfg.get("joint_positions", [])
+            hold_targets = torch.as_tensor(
+                raw_targets, dtype=torch.float32, device=self.device
+            ).flatten()
+            if hold_targets.numel() < self.drone.num_arm_joints:
+                padded = torch.zeros(self.drone.num_arm_joints, device=self.device)
+                padded[: hold_targets.numel()] = hold_targets
+                hold_targets = padded
+            elif hold_targets.numel() > self.drone.num_arm_joints:
+                hold_targets = hold_targets[: self.drone.num_arm_joints]
+            self._arm_hold_enabled = True
+            self._arm_hold_targets = hold_targets
+            self._arm_hold_zero_velocity_each_step = bool(
+                _arm_hold_cfg.get("zero_velocity_each_step", False)
+            )
+            logging.info(
+                "Arm hold enabled with targets=%s",
+                hold_targets.detach().cpu().tolist(),
+            )
+
+        _arm_cfg = cfg.task.get("arm_motion", None)
+        _arm_motion_requested = _arm_cfg is not None and _arm_cfg.get("enabled", False)
+        if _arm_motion_requested and self._arm_hold_enabled:
+            logging.info("arm_motion is ignored because arm_hold is enabled.")
+        elif _arm_motion_requested and _has_arm_joints:
+            self._arm_motion_enabled = True
+            self._arm_active_joint = int(_arm_cfg.get("active_joint", 0))
+            self._arm_amplitude = float(_arm_cfg.get("amplitude", 0.3))
+            self._arm_frequency = float(_arm_cfg.get("frequency", 0.5))
+
         if "drone" in self.randomization:
             self.drone.setup_randomization(self.randomization["drone"])
         if "payload" in self.randomization:
@@ -140,22 +205,44 @@ class Hover(IsaacEnv):
             )
             self.payload.initialize()
 
-        self.target_vis = ArticulationView(
-            "/World/envs/env_*/target",
-            reset_xform_properties=False
-        )
+        if self._hover_simple_target_marker:
+            self.target_vis = RigidPrimView(
+                "/World/envs/env_*/target",
+                name="hover_target_marker",
+                reset_xform_properties=False,
+                shape=(-1,),
+            )
+        else:
+            # ArticulationRootAPI may live on a sub-prim (e.g. base_link for AmovDrone).
+            # hover_target_root_rel gives the relative path from the spawn root to that prim.
+            _root_rel = getattr(self.drone.__class__, "hover_target_root_rel", None)
+            _target_view_path = (
+                f"/World/envs/env_*/target/{_root_rel}" if _root_rel else "/World/envs/env_*/target"
+            )
+            self.target_vis = ArticulationView(
+                _target_view_path,
+                reset_xform_properties=False,
+            )
         self.target_vis.initialize()
         self.init_poses = self.drone.get_world_poses(clone=True)
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
-        self.init_pos_dist = D.Uniform(
-            torch.tensor([-2.5, -2.5, 1.], device=self.device),
-            torch.tensor([2.5, 2.5, 2.5], device=self.device)
-        )
-        self.init_rpy_dist = D.Uniform(
-            torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
-            torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
-        )
+        _init_pos_cfg = cfg.task.get("init_pos_range", None)
+        if _init_pos_cfg is None:
+            _pos_low = torch.tensor([-2.5, -2.5, 1.0], device=self.device)
+            _pos_high = torch.tensor([2.5, 2.5, 2.5], device=self.device)
+        else:
+            _pos_low = torch.tensor(_init_pos_cfg["low"], device=self.device)
+            _pos_high = torch.tensor(_init_pos_cfg["high"], device=self.device)
+        self.init_pos_dist = D.Uniform(_pos_low, _pos_high)
+        init_rpy_cfg = cfg.task.get("init_rpy_range", None)
+        if init_rpy_cfg is None:
+            init_rpy_low = torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi
+            init_rpy_high = torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
+        else:
+            init_rpy_low = torch.tensor(init_rpy_cfg["low"], device=self.device) * torch.pi
+            init_rpy_high = torch.tensor(init_rpy_cfg["high"], device=self.device) * torch.pi
+        self.init_rpy_dist = D.Uniform(init_rpy_low, init_rpy_high)
         self.target_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
             torch.tensor([0., 0., 2.], device=self.device) * torch.pi
@@ -164,6 +251,9 @@ class Hover(IsaacEnv):
         self.target_pos = torch.tensor([[0.0, 0.0, 2.]], device=self.device)
         self.target_heading = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.alpha = 0.8
+        self._has_invalid_state = torch.zeros(
+            self.num_envs, 1, dtype=torch.bool, device=self.device
+        )
 
     def _design_scene(self):
         import omni_drones.utils.kit as kit_utils
@@ -174,20 +264,57 @@ class Hover(IsaacEnv):
             drone_model_cfg.name, drone_model_cfg.controller
         )
 
-        target_vis_prim = prim_utils.create_prim(
-            prim_path="/World/envs/env_0/target",
-            usd_path=self.drone.usd_path,
-            translation=(0.0, 0.0, 2.),
-        )
+        target_prim_path = "/World/envs/env_0/target"
+        if self._hover_target_usd_override is not None:
+            target_usd = self._hover_target_usd_override
+            target_vis_prim = prim_utils.create_prim(
+                prim_path=target_prim_path,
+                usd_path=target_usd,
+                translation=(0.0, 0.0, 2.0),
+            )
+            kit_utils.set_nested_collision_properties(
+                target_vis_prim.GetPath(),
+                collision_enabled=False,
+            )
+            kit_utils.set_nested_rigid_body_properties(
+                target_vis_prim.GetPath(),
+                disable_gravity=True,
+            )
+        elif self._hover_target_use_drone_visual:
+            target_usd = getattr(
+                self.drone.__class__, "hover_target_usd_path", None
+            ) or self.drone.usd_path
+            target_vis_prim = prim_utils.create_prim(
+                prim_path=target_prim_path,
+                usd_path=target_usd,
+                translation=(0.0, 0.0, 2.0),
+            )
+            kit_utils.set_nested_collision_properties(
+                target_vis_prim.GetPath(),
+                collision_enabled=False,
+            )
+            kit_utils.set_nested_rigid_body_properties(
+                target_vis_prim.GetPath(),
+                disable_gravity=True,
+            )
+        else:
+            from omni.isaac.core.objects import DynamicCuboid
 
-        kit_utils.set_nested_collision_properties(
-            target_vis_prim.GetPath(),
-            collision_enabled=False
-        )
-        kit_utils.set_nested_rigid_body_properties(
-            target_vis_prim.GetPath(),
-            disable_gravity=True
-        )
+            DynamicCuboid(
+                target_prim_path,
+                translation=torch.tensor([0.0, 0.0, 2.0]),
+                scale=torch.tensor([0.22, 0.22, 0.22]),
+                color=torch.tensor([0.15, 0.85, 0.25]),
+                size=1.0,
+            )
+            kit_utils.set_collision_properties(
+                target_prim_path,
+                collision_enabled=False,
+            )
+            kit_utils.set_rigid_body_properties(
+                target_prim_path,
+                disable_gravity=True,
+            )
 
         kit_utils.create_ground_plane(
             "/World/defaultGroundPlane",
@@ -240,12 +367,18 @@ class Hover(IsaacEnv):
             "heading_alignment": UnboundedContinuousTensorSpec(1),
             "uprightness": UnboundedContinuousTensorSpec(1),
             "action_smoothness": UnboundedContinuousTensorSpec(1),
+            "mean_throttle": UnboundedContinuousTensorSpec(1),
+            "mean_thrust_n": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
+        if self._arm_hold_enabled:
+            self.drone.reset_arm_joints(env_ids, self._arm_hold_targets)
+        elif self._arm_motion_enabled:
+            self.drone.reset_arm_joints(env_ids)
 
         pos = self.init_pos_dist.sample((*env_ids.shape, 1))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
@@ -279,20 +412,73 @@ class Hover(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0)
+        actions = actions.clamp(-1.0, 1.0)
+
+        # Normalize action space so that:
+        #   policy output = 0  →  hover thrust  (center of action space)
+        #   policy output = ±1 →  ±scale deviation around hover, NO clamping
+        #
+        # RotorGroup maps: target_throttle = sqrt((cmd+1)/2), thrust = throttle^2 * KF.
+        # Hover requires cmd = 2*(mg/KF_sum) - 1.
+        #
+        # For AmovDrone: hover_cmd ≈ -0.484.
+        # Without scaling, action + offset maps to [-1.484, 0.516] → ~33% of random
+        # samples are clamped to cmd=-1 (zero thrust), biasing mean thrust far below hover.
+        # For Firefly: hover_cmd ≈ -0.183, only ~18% clamped → trains OK without fix.
+        # With scaling by (1 - |offset|), actions in [-1,1] map exactly to [-1, 0.032]
+        # with zero clamping → symmetric exploration around hover.
+        if not hasattr(self, "_hover_cmd_offset"):
+            with torch.no_grad():
+                _g = self.drone.gravity.mean()
+                _kf = self.drone.KF.sum(-1).mean().clamp_min(1e-9)
+                _hover_frac = (_g / _kf).clamp(0.0, 1.0)
+                self._hover_cmd_offset = float((2.0 * _hover_frac - 1.0).item())
+                # Symmetric scale: ±1 action maps to ±scale around hover_cmd, no clamp
+                self._hover_cmd_scale = float(1.0 - abs(self._hover_cmd_offset))
+            logging.info(
+                "Hover action normalization: hover_frac=%.4f  hover_cmd=%.4f  scale=%.4f"
+                "  (action=0 → hover, action=±1 → cmd=%.3f/%.3f)",
+                float(_hover_frac.item()),
+                self._hover_cmd_offset,
+                self._hover_cmd_scale,
+                self._hover_cmd_offset - self._hover_cmd_scale,
+                self._hover_cmd_offset + self._hover_cmd_scale,
+            )
+        actions = (actions * self._hover_cmd_scale + self._hover_cmd_offset).clamp(-1.0, 1.0)
+
         self.effort = self.drone.apply_action(actions)
+        if self._arm_hold_enabled:
+            self.drone.hold_arm_joints(
+                self._arm_hold_targets,
+                zero_velocity=self._arm_hold_zero_velocity_each_step,
+            )
+        elif self._arm_motion_enabled:
+            self.drone.apply_arm_motion(
+                self.progress_buf,
+                self.dt * self.substeps,
+                active_joint=self._arm_active_joint,
+                amplitude=self._arm_amplitude,
+                frequency=self._arm_frequency,
+            )
 
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state()
+        self._has_invalid_state = ~torch.isfinite(self.drone_state).all(-1)
+        safe_drone_state = torch.nan_to_num(
+            self.drone_state, nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         # relative position and heading
-        self.rpos = self.target_pos - self.drone_state[..., :3]
-        self.rheading = self.target_heading - self.drone_state[..., 13:16]
+        self.rpos = self.target_pos - safe_drone_state[..., :3]
+        self.rheading = self.target_heading - safe_drone_state[..., 13:16]
 
-        obs = [self.rpos, self.drone_state[..., 3:], self.rheading,]
+        obs = [self.rpos, safe_drone_state[..., 3:], self.rheading]
         if self.time_encoding:
             t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
             obs.append(t.expand(-1, self.time_encoding_dim).unsqueeze(1))
         obs = torch.cat(obs, dim=-1)
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
         return TensorDict(
             {
@@ -306,24 +492,51 @@ class Hover(IsaacEnv):
         )
 
     def _compute_reward_and_done(self):
-        # pose reward
-        pos_error = torch.norm(self.rpos, dim=-1)
-        heading_alignment = torch.sum(self.drone.heading * self.target_heading, dim=-1)
+        safe_rpos = torch.nan_to_num(self.rpos, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_rheading = torch.nan_to_num(self.rheading, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_heading = torch.nan_to_num(self.drone.heading, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_up = torch.nan_to_num(self.drone.up, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_vel = torch.nan_to_num(self.drone.vel, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_effort = torch.nan_to_num(self.effort, nan=0.0, posinf=1e6, neginf=0.0)
+        safe_throttle_diff = torch.nan_to_num(
+            self.drone.throttle_difference, nan=0.0, posinf=1e6, neginf=0.0
+        )
 
-        distance = torch.norm(torch.cat([self.rpos, self.rheading], dim=-1), dim=-1)
+        # pose reward
+        pos_error = torch.norm(safe_rpos, dim=-1)
+        heading_alignment = torch.sum(safe_heading * self.target_heading, dim=-1)
+
+        distance = torch.norm(torch.cat([safe_rpos, safe_rheading], dim=-1), dim=-1)
 
         reward_pose = 1.0 / (1.0 + torch.square(self.reward_distance_scale * distance))
         # pose_reward = torch.exp(-distance * self.reward_distance_scale)
         # uprightness
-        reward_up = torch.square((self.drone.up[..., 2] + 1) / 2)
+        reward_up = torch.square((safe_up[..., 2] + 1) / 2)
 
         # spin reward
-        spinnage = torch.square(self.drone.vel[..., -1])
+        spinnage = torch.square(safe_vel[..., -1])
         reward_spin = 1.0 / (1.0 + torch.square(spinnage))
 
         # effort
-        reward_effort = self.reward_effort_weight * torch.exp(-self.effort)
-        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.drone.throttle_difference)
+        reward_effort = self.reward_effort_weight * torch.exp(-safe_effort)
+        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-safe_throttle_diff)
+
+        # survival: height-proportional reward normalized between ground and target height.
+        # r_alive = 0 at ground_reset_height, 1.0 at target z (2.0m), capped above.
+        # This provides a continuous upward gradient regardless of spawn height.
+        safe_pos_z_for_alive = torch.nan_to_num(self.drone.pos[..., 2], nan=-1.0)
+        target_z = float(self.target_pos[..., 2].mean().item())  # target height (default 2.0m)
+        alive_denom = max(target_z - self.ground_reset_height, 0.1)
+        reward_alive = torch.clamp(
+            (safe_pos_z_for_alive - self.ground_reset_height) / alive_denom, 0.0, 1.0
+        )
+
+        # Standalone uprightness reward: incentivizes upright attitude independent
+        # of position error.  reward_up (above) is gated by reward_pose (small when
+        # far from target), so early in training when pos_error is large the pose-
+        # gated signal is weak.  This standalone term provides a direct gradient to
+        # keep the drone right-side-up from the first episode.
+        reward_up_standalone = self.reward_up_weight * ((safe_up[..., 2] + 1.0) / 2.0)
 
         assert reward_pose.shape == reward_up.shape == reward_spin.shape
         reward = (
@@ -331,18 +544,64 @@ class Hover(IsaacEnv):
             + reward_pose * (reward_up + reward_spin)
             + reward_effort
             + reward_action_smoothness
+            + reward_alive
+            + reward_up_standalone
         )
+        reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 
-        misbehave = (self.drone.pos[..., 2] < 0.2) | (distance > 4)
-        hasnan = torch.isnan(self.drone_state).any(-1)
+        safe_pos_z = torch.nan_to_num(self.drone.pos[..., 2], nan=-1.0, posinf=1e6, neginf=-1e6)
+        misbehave = (safe_pos_z < self.ground_reset_height) | (distance > 4)
+        if self.min_up_z > -1.0:
+            misbehave = misbehave | (safe_up[..., 2] < self.min_up_z)
+        hasnan = self._has_invalid_state
 
         terminated = misbehave | hasnan
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
+        reward = reward.masked_fill(hasnan, 0.0)
 
-        self.stats["pos_error"].lerp_(pos_error, (1-self.alpha))
-        self.stats["heading_alignment"].lerp_(heading_alignment, (1-self.alpha))
-        self.stats["uprightness"].lerp_(self.drone_state[..., 18], (1-self.alpha))
-        self.stats["action_smoothness"].lerp_(-self.drone.throttle_difference, (1-self.alpha))
+        # ── termination diagnosis (prints once every ~200 env-resets) ──────────
+        if not hasattr(self, "_term_diag_counter"):
+            self._term_diag_counter = 0
+        any_done = (terminated | truncated).any()
+        if any_done:
+            self._term_diag_counter += int((terminated | truncated).sum().item())
+            if self._term_diag_counter >= 50:
+                self._term_diag_counter = 0
+                env_ids = (terminated | truncated).squeeze(-1).nonzero(as_tuple=False).squeeze(-1)
+                if env_ids.numel() > 0:
+                    _eid = env_ids[0]
+                    _z   = safe_pos_z[_eid].item()
+                    _d   = distance[_eid].item()
+                    _upz = safe_up[_eid, ..., 2].mean().item()
+                    _nan = hasnan[_eid].any().item()
+                    _len = self.progress_buf[_eid].item()
+                    _thr = self.drone.throttle[_eid].mean().item()
+                    _frc = self.drone.thrusts[_eid, ..., 2].sum().item()
+                    logging.info(
+                        "[TermDiag] env=%d  len=%d  z=%.3f(reset<%.2f)  dist=%.2f(>4?)  up_z=%.3f  hasnan=%s"
+                        "  thr=%.4f  thrust=%.1fN  hover=%.1fN",
+                        int(_eid), int(_len), _z, self.ground_reset_height,
+                        _d, _upz, str(_nan), _thr, _frc,
+                        float(self.drone.gravity.mean().item()),
+                    )
+        # ──────────────────────────────────────────────────────────────────────
+
+        self.stats["pos_error"].lerp_(torch.nan_to_num(pos_error, nan=0.0), (1-self.alpha))
+        self.stats["heading_alignment"].lerp_(torch.nan_to_num(heading_alignment, nan=0.0), (1-self.alpha))
+        safe_uprightness = torch.nan_to_num(self.drone_state[..., 18], nan=0.0, posinf=0.0, neginf=0.0)
+        self.stats["uprightness"].lerp_(safe_uprightness, (1-self.alpha))
+        self.stats["action_smoothness"].lerp_(
+            torch.nan_to_num(-safe_throttle_diff, nan=0.0), (1-self.alpha)
+        )
+        # throttle and thrust diagnostics (smoothed per-env)
+        _mean_thr = self.drone.throttle.mean(dim=-1, keepdim=True)  # mean over rotors → (envs,1,1) or (envs,1)
+        if _mean_thr.dim() == 3:
+            _mean_thr = _mean_thr.squeeze(-1)  # → (envs, 1)
+        self.stats["mean_throttle"].lerp_(torch.nan_to_num(_mean_thr, nan=0.0), (1 - self.alpha))
+        _thrust_sum = self.drone.thrusts[..., 2].sum(dim=-1, keepdim=True)  # total thrust per env (N)
+        if _thrust_sum.dim() == 3:
+            _thrust_sum = _thrust_sum.squeeze(-1)
+        self.stats["mean_thrust_n"].lerp_(torch.nan_to_num(_thrust_sum, nan=0.0), (1 - self.alpha))
         self.stats["return"] += reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
 
