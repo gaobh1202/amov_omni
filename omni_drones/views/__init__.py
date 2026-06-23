@@ -673,6 +673,18 @@ class RigidPrimView(_RigidPrimView):
         self, velocities: torch.Tensor, env_indices: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         indices = self._resolve_env_indices(env_indices)
+        sim_view = getattr(self, "_physics_sim_view", None)
+        if (
+            not omni.timeline.get_timeline_interface().is_stopped()
+            and self._physics_view is not None
+            and sim_view is not None
+        ):
+            # Use GPU-direct API to avoid PxRigidDynamic CPU API conflict.
+            with disable_warnings(sim_view):
+                vels = self._physics_view.get_velocities()
+                vels[indices] = velocities.reshape(-1, 6)
+                self._physics_view.set_velocities(vels, indices)
+            return
         return super().set_velocities(velocities.reshape(-1, 6), indices)
 
     def get_net_contact_forces(

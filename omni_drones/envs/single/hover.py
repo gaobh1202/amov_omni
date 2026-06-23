@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import logging
+import math
 import torch
 import torch.distributions as D
 
@@ -122,6 +123,14 @@ class Hover(IsaacEnv):
         self.has_payload = "payload" in self.randomization.keys()
         self.ground_reset_height = float(cfg.task.get("ground_reset_height", 0.2))
         self.min_up_z = float(cfg.task.get("min_up_z", -1.0))
+        _arm_log_cfg = cfg.task.get("arm_log", None)
+        self._arm_log_enabled = bool(
+            _arm_log_cfg is not None and _arm_log_cfg.get("enabled", False)
+        )
+        self._arm_log_interval = int(
+            _arm_log_cfg.get("log_interval", 200) if _arm_log_cfg else 200
+        )
+        self._arm_log_counter = 0
 
         ht = cfg.task.get("hover_target")
         if ht is None:
@@ -185,6 +194,56 @@ class Hover(IsaacEnv):
             self._arm_active_joint = int(_arm_cfg.get("active_joint", 0))
             self._arm_amplitude = float(_arm_cfg.get("amplitude", 0.3))
             self._arm_frequency = float(_arm_cfg.get("frequency", 0.5))
+
+        # Multi-joint sinusoidal trajectory (arm_trajectory).
+        # Takes priority over arm_motion but is overridden by arm_hold.
+        self._arm_trajectory_enabled = False
+        self._arm_traj_amplitudes: torch.Tensor = None
+        self._arm_traj_frequencies: torch.Tensor = None
+        self._arm_traj_phases: torch.Tensor = None
+
+        _arm_traj_cfg = cfg.task.get("arm_trajectory", None)
+        _arm_traj_requested = (
+            _arm_traj_cfg is not None
+            and _arm_traj_cfg.get("enabled", False)
+            and _arm_traj_cfg.get("joints", None) is not None
+        )
+        if _arm_traj_requested and self._arm_hold_enabled:
+            logging.info("arm_trajectory is ignored because arm_hold is enabled.")
+        elif _arm_traj_requested and _has_arm_joints:
+            self._arm_trajectory_enabled = True
+            # Disable single-joint arm_motion when trajectory is active.
+            self._arm_motion_enabled = False
+            n = self.drone.num_arm_joints
+            joints_cfg = list(_arm_traj_cfg.get("joints", []))
+            amplitudes = torch.zeros(n, device=self.device)
+            frequencies = torch.zeros(n, device=self.device)
+            phases = torch.zeros(n, device=self.device)
+            for i, jcfg in enumerate(joints_cfg):
+                if i >= n:
+                    break
+                amplitudes[i] = float(jcfg.get("amplitude", 0.3))
+                frequencies[i] = float(jcfg.get("frequency", 0.3))
+                phases[i] = float(jcfg.get("phase", 0.0))
+            self._arm_traj_amplitudes = amplitudes
+            self._arm_traj_frequencies = frequencies
+            self._arm_traj_phases = phases
+            # Apply PD gains for arm joints.
+            stiffness_val = float(_arm_traj_cfg.get("stiffness", 500.0))
+            damping_val = float(_arm_traj_cfg.get("damping", 50.0))
+            stiffness = torch.full(
+                (self.drone._view.count, n), stiffness_val, device=self.device
+            )
+            damping = torch.full(
+                (self.drone._view.count, n), damping_val, device=self.device
+            )
+            self.drone._view.set_gains(
+                stiffness, damping, joint_indices=self.drone.arm_joint_indices
+            )
+            logging.info(
+                "arm_trajectory enabled: %d joints | amplitudes=%s | frequencies=%s | stiffness=%.1f | damping=%.1f",
+                n, amplitudes.tolist(), frequencies.tolist(), stiffness_val, damping_val,
+            )
 
         if "drone" in self.randomization:
             self.drone.setup_randomization(self.randomization["drone"])
@@ -379,6 +438,8 @@ class Hover(IsaacEnv):
             self.drone.reset_arm_joints(env_ids, self._arm_hold_targets)
         elif self._arm_motion_enabled:
             self.drone.reset_arm_joints(env_ids)
+        elif self._arm_trajectory_enabled:
+            self.drone.reset_arm_joints(env_ids)
 
         pos = self.init_pos_dist.sample((*env_ids.shape, 1))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
@@ -461,6 +522,24 @@ class Hover(IsaacEnv):
                 amplitude=self._arm_amplitude,
                 frequency=self._arm_frequency,
             )
+        elif self._arm_trajectory_enabled:
+            self._apply_arm_trajectory()
+
+    def _apply_arm_trajectory(self):
+        """Drive all arm joints with independent sinusoidal trajectories."""
+        if self.drone.arm_joint_indices is None or self.drone.num_arm_joints == 0:
+            return
+        t = self.progress_buf.float() * (self.dt * self.substeps)  # (num_envs,)
+        pos = (
+            self._arm_traj_amplitudes.unsqueeze(0)
+            * torch.sin(
+                2.0 * math.pi * self._arm_traj_frequencies.unsqueeze(0) * t.unsqueeze(1)
+                + self._arm_traj_phases.unsqueeze(0)
+            )
+        )  # (num_envs, num_arm_joints)
+        self.drone._view.set_joint_position_targets(
+            pos, joint_indices=self.drone.arm_joint_indices
+        )
 
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state()
@@ -469,7 +548,6 @@ class Hover(IsaacEnv):
             self.drone_state, nan=0.0, posinf=0.0, neginf=0.0
         )
 
-        # relative position and heading
         self.rpos = self.target_pos - safe_drone_state[..., :3]
         self.rheading = self.target_heading - safe_drone_state[..., 13:16]
 
@@ -604,6 +682,25 @@ class Hover(IsaacEnv):
         self.stats["mean_thrust_n"].lerp_(torch.nan_to_num(_thrust_sum, nan=0.0), (1 - self.alpha))
         self.stats["return"] += reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
+
+        # Log arm joint positions periodically (only when arm joints exist).
+        if self._arm_log_enabled:
+            _has_arm = (
+                hasattr(self.drone, "arm_joint_indices")
+                and self.drone.arm_joint_indices is not None
+            )
+            if _has_arm:
+                self._arm_log_counter += 1
+                if self._arm_log_counter >= self._arm_log_interval:
+                    self._arm_log_counter = 0
+                    all_pos = self.drone._view.get_joint_positions()  # (num_envs, [1,] num_dof)
+                    arm_pos = all_pos.flatten(0, -2)[..., self.drone.arm_joint_indices]  # (num_envs, num_arm_joints)
+                    mean_pos = arm_pos.mean(dim=0).detach().cpu().flatten().tolist()
+                    names = self.drone._arm_dof_names
+                    joint_str = "  ".join(
+                        f"{n}={v:.4f}" for n, v in zip(names, mean_pos)
+                    )
+                    logging.info("[ArmJoints] step=%d  %s", int(self.progress_buf.float().mean().item()), joint_str)
 
         return TensorDict(
             {
