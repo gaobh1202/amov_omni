@@ -1,0 +1,120 @@
+运行drone+arm环境
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd python scripts/train.py task=HoverAmovArm algo=ppo headless=false algo.actor_log_std_init=-1.0
+
+运行drone+运动Arm执行Hover任务
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/train.py task=HoverAmovDynaArm algo=ppo headless=false \
+algo.actor_log_std_init=-1.0
+
+
+ 脚本功能
+
+  scripts/eval_hover_robustness.py 是一个专门用来测试已训练策略鲁棒性的评估脚本，支持两种测试模式。
+
+  ---
+  两种测试模式
+
+  模式一：test=target — 目标位置变动测试
+
+  目的：验证策略能否跟随移动的悬停目标点。
+
+  原理：在 _compute_state_and_obs 上挂一个 hook，每隔 target_change_interval（默认 100
+  步）就把目标位置随机移动到 XY 平面 ±1.5m
+  范围内的新位置，同时移动场景中的可视化标记。策略每步都能从观测中看到新的
+  rpos（相对目标的位置误差），所以理论上能追踪。
+
+  运行命令：
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+    task=HoverAmovDynaArm algo=ppo headless=false \
+    checkpoint=wandb/run-20260601_002626-jbg781op/files/checkpoint_final.pt \
+    test=target \
+    target_change_interval=100 \
+    target_pos_range=1.5
+
+  ---
+  模式二：test=arm_perturb — 机械臂轨迹扰动测试
+
+  目的：验证策略在训练轨迹之外的机械臂运动条件下是否仍能稳定悬停。
+
+  原理：在 _reset_idx 上挂一个 hook，每次 episode
+  重置时对每个关节的幅度（amplitude）和频率（frequency）乘以一个随机系数。arm_perturb_scale=0.5
+  意味着参数在原始值的 50%～150% 之间随机变化。这直接模拟了"机械臂运动模式与训练时不同"的场景。
+
+  运行命令：
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+    task=HoverAmovDynaArm algo=ppo headless=false \
+    checkpoint=wandb/run-20260601_002626-jbg781op/files/checkpoint_final.pt \
+    test=arm_perturb \
+
+  运行命令：
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+    task=HoverAmovDynaArm algo=ppo headless=false \
+    checkpoint=wandb/run-20260601_002626-jbg781op/files/checkpoint_final.pt \
+    test=arm_perturb \
+    arm_perturb_scale=0.5
+
+
+---
+  第一步：sanity check（固定臂 + 固定目标，验证 checkpoint 加载正确）
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+  task=HoverAmovArm algo=ppo headless=false \
+  checkpoint=/home/benhua/OmniDrones/wandb/run-20260528_224358-amov_drone_arm_hover/files/checkpoint_final.pt \
+  test=fixed
+  这一步机械臂保持训练时的 arm_hold 姿态（全零关节），目标位置固定在
+  (0,0,2)，和训练条件完全一致。episode_len 应该接近 500，pos_error 应该接近训练时的
+  0.038m。
+
+  ---
+第二步：target 变动测试（臂姿态不变，目标每 200 步移动一次）     
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py task=HoverAmovArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260528_224358-amov_drone_arm_hover/files/checkpoint_final.pt \
+test=target \
+target_change_interval=150 \
+target_pos_range=1.5 \
+max_episode_length=700 
+
+#  max_episode_length=500，每 200 步换一次目标，一个 episode 内最多换 2
+#  target_pos_range=1.5
+#  max_episode_length=500，每 200 步换一次目标，一个 episode 内最多换 2 次。给策略足够时间（200 步 × 0.016s
+#  = 3.2 秒）调整到新目标。
+
+
+ 三步测试命令如下：
+
+  ---
+第一步：fixed
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py task=HoverAmovDynaArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt \
+test=fixed
+
+第二步：target（机械臂轨迹不变，目标每 300 步移动）
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py task=HoverAmovDynaArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt \
+test=target target_change_interval=150 target_pos_range=1.5 
+
+第三步：target_arm（目标变化 + 机械臂轨迹同时扰动）
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py task=HoverAmovDynaArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt \
+test=target_arm target_change_interval=150 target_pos_range=1.5 arm_perturb_scale=0.5
+
+max_episode_length=700
+
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+    task=HoverAmovDynaArm \
+    algo=ppo \
+    headless=false \
+    checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/che
+  ckpoint_final.pt \
+    test=fixed \
+    num_episodes=128
+
+

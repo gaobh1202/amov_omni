@@ -22,6 +22,7 @@
 
 
 from .hover import Hover
+from .hover_shelf_grasp import HoverShelfGrasp
 from .track import Track
 from .fly_through import FlyThrough
 from .forest import Forest

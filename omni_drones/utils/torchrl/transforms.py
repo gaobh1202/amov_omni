@@ -209,15 +209,54 @@ def ravel_composite(
 
 
 class RateController(Transform):
+    """Maps a 4-dim policy action [roll_rate, pitch_rate, yaw_rate, thrust] in [-1, 1]
+    to rotor commands via the body-rate controller.
+
+    ``max_rate`` sets the per-axis body-rate authority in rad/s (scalar or 3-sequence,
+    defaults to pi for backward compatibility). ``thrust_range`` restricts the
+    collective thrust to a fraction band of the maximum thrust. Both act as *hard*
+    limits: the policy physically cannot command anything outside them, which is
+    what keeps a learned policy deployable on real hardware.
+
+    The pre-transform action is forwarded under ``raw_action_key`` so the env can
+    penalize action magnitude / rate. IsaacEnv._step builds a fresh output
+    tensordict, so this extra key never leaks into the ``"next"`` entry.
+    """
+
     def __init__(
         self,
         controller,
         action_key: str = ("agents", "action"),
+        max_rate=None,
+        thrust_range=None,
+        raw_action_key: str = ("agents", "policy_action"),
     ):
         super().__init__([], in_keys_inv=[("info", "drone_state")])
         self.controller = controller
         self.action_key = action_key
+        self.raw_action_key = raw_action_key
         self.max_thrust = self.controller.max_thrusts.sum(-1)
+
+        # `max_thrust` is 0-dim so it broadcasts against a cuda tensor even while it
+        # still lives on the CPU; `max_rate` is a 3-vector and does not, so it has to
+        # be moved to the action's device on first use (the transform's own tensors
+        # are not carried along when TransformedEnv moves its submodules).
+        device = self.max_thrust.device
+        if max_rate is None:
+            max_rate = [torch.pi] * 3
+        elif isinstance(max_rate, (int, float)):
+            max_rate = [float(max_rate)] * 3
+        else:
+            max_rate = [float(v) for v in max_rate]
+            if len(max_rate) != 3:
+                raise ValueError(f"max_rate must be a scalar or 3 values, got {max_rate}")
+        self.max_rate = torch.tensor(max_rate, dtype=torch.float32, device=device)
+
+        if thrust_range is None:
+            thrust_range = (0., 1.)
+        self.thrust_low, self.thrust_high = float(thrust_range[0]), float(thrust_range[1])
+        if not 0. <= self.thrust_low < self.thrust_high <= 1.:
+            raise ValueError(f"invalid thrust_range: {thrust_range}")
 
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
         action_spec = input_spec[("full_action_spec", *self.action_key)]
@@ -228,12 +267,16 @@ class RateController(Transform):
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
         action = tensordict[self.action_key]
+        tensordict.set(self.raw_action_key, action.clone())
+        if self.max_rate.device != action.device:
+            self.max_rate = self.max_rate.to(action.device)
         target_rate, target_thrust = action.split([3, 1], -1)
-        target_thrust = ((target_thrust + 1) / 2).clip(0.) * self.max_thrust
+        thrust_ratio = ((target_thrust + 1) / 2).clip(0., 1.)
+        thrust_ratio = self.thrust_low + (self.thrust_high - self.thrust_low) * thrust_ratio
         cmds = self.controller(
             drone_state,
-            target_rate=target_rate * torch.pi,
-            target_thrust=target_thrust
+            target_rate=target_rate.clip(-1., 1.) * self.max_rate,
+            target_thrust=thrust_ratio * self.max_thrust
         )
         torch.nan_to_num_(cmds, 0.)
         tensordict.set(self.action_key, cmds)

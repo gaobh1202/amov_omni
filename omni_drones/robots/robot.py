@@ -173,6 +173,15 @@ class RobotBase(abc.ABC):
             prim_paths_expr = f"/World/envs/.*/{self.name}_.*"
         self.prim_paths_expr = prim_paths_expr
 
+        # Reuse the SimulationContext's own physics simulation view instead of
+        # letting each view create its own. ``ArticulationView.initialize(None)``
+        # calls ``create_simulation_view`` + ``set_subspace_roots("/")``, and a
+        # second robot doing that invalidates the first robot's backend buffers:
+        # with six robots in one scene the first write raised "Failed to get DOF
+        # position targets from backend", and a read segfaulted. Passing the
+        # shared view is also what Isaac's own scene.add() path does.
+        physics_sim_view = SimulationContext.instance().physics_sim_view
+
         # create handles
         # -- robot articulation
         if self.is_articulation:
@@ -192,7 +201,7 @@ class RobotBase(abc.ABC):
             self.articulation = None
             self.articulation_indices = None
 
-        self._view.initialize()
+        self._view.initialize(physics_sim_view)
         # set the default state
         self._view.post_reset()
         self.shape = torch.arange(self._view.count).reshape(-1, self.n).shape

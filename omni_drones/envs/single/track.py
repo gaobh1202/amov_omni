@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 
+import logging
 import omni_drones.utils.kit as kit_utils
 from omni_drones.utils.torch import euler_to_quaternion, quat_rotate
 import omni.isaac.core.utils.prims as prim_utils
@@ -83,6 +84,25 @@ class Track(IsaacEnv):
     | `future_traj_steps`     | int   | 4             | Number of future trajectory steps the drone needs to predict.                                                                                                                                                                           |
     | `reward_distance_scale` | float | 1.2           | Scales the reward based on the distance between the drone and its target.                                                                                                                                                               |
     | `time_encoding`         | bool  | True          | Indicates whether to include time encoding in the observation space. If set to True, a 4-dimensional vector encoding the current progress of the episode is included in the observation. If set to False, this feature is not included. |
+
+    ### Trajectory shaping (optional)
+
+    | `traj_w` | [low, high] | [0.8, 1.1] | Angular rate along the lemniscate. One lap takes about `2*pi/(w*dt)` control steps, so lowering `w` slows the demanded flight speed proportionally. |
+    | `traj_scale` | [[x,y,z], [x,y,z]] | [[1.8,1.8,1.0],[3.2,3.2,1.5]] | Size of the figure-eight; smaller means gentler curvature and lower lateral acceleration. |
+    | `traj_c` | [low, high] | [-0.6, 0.6] | Vertical amplitude coefficient. |
+    | `init_rpy` | [[r,p,y],[r,p,y]] | [[-.2,-.2,0],[.2,.2,2]] | Spawn attitude range, in units of pi. |
+
+    ### Smoothness / attitude shaping (optional, all default to 0 = original behaviour)
+
+    | `penalty_spin_weight` | float | 0. | Penalty on squared body yaw rate. Unlike the saturating `reward_spin` bonus this keeps growing, so it actually suppresses fast spinning. |
+    | `penalty_body_rate_weight` | float | 0. | Penalty on squared body roll/pitch rate. |
+    | `penalty_tilt_weight` | float | 0. | Penalty on `1 - up_z` (roughly half the squared tilt angle). |
+    | `penalty_action_weight` | float | 0. | Penalty on the squared commanded body rates of the *policy* action. Requires `action_transform: rate`. |
+    | `penalty_action_rate_weight` | float | 0. | Penalty on the squared step-to-step change of the policy action. Requires `action_transform: rate`. |
+    | `reward_heading_weight` | float | 0. | Bonus (scaled by `reward_pose`) for pointing along the heading reference. |
+    | `heading_mode` | str | "none" | "fixed" tracks the constant world heading `heading_ref`; "tangent" tracks the trajectory direction. |
+    | `heading_ref` | [x, y] | [1., 0.] | World-frame xy heading reference for `heading_mode: fixed`. |
+    | `max_tilt_deg` | float | None | Terminate the episode once the drone tips past this angle. |
     """
     def __init__(self, cfg, headless):
         self.reset_thres = cfg.task.reset_thres
@@ -94,6 +114,33 @@ class Track(IsaacEnv):
         assert self.future_traj_steps > 0
         self.intrinsics = cfg.task.intrinsics
         self.wind = cfg.task.wind
+        self.ground_reset_height = float(cfg.task.get("ground_reset_height", 0.1))
+        self._arm_hold_enabled = False
+        self._arm_hold_targets = None
+
+        # --- smoothness / attitude shaping (all default to 0 -> original behaviour) ---
+        # Explicit penalties, subtracted from the reward. Unlike the saturating
+        # `reward_spin` bonus, these keep pushing down as the motion gets more violent.
+        self.penalty_spin_weight = float(cfg.task.get("penalty_spin_weight", 0.))
+        self.penalty_body_rate_weight = float(cfg.task.get("penalty_body_rate_weight", 0.))
+        self.penalty_tilt_weight = float(cfg.task.get("penalty_tilt_weight", 0.))
+        self.penalty_action_weight = float(cfg.task.get("penalty_action_weight", 0.))
+        self.penalty_action_rate_weight = float(cfg.task.get("penalty_action_rate_weight", 0.))
+        self.reward_heading_weight = float(cfg.task.get("reward_heading_weight", 0.))
+        self.heading_mode = str(cfg.task.get("heading_mode", "none")).lower()
+        if self.heading_mode not in ("none", "fixed", "tangent"):
+            raise ValueError(f"unknown heading_mode: {self.heading_mode}")
+        # World-frame xy heading reference for heading_mode="fixed". A *constant*
+        # reference keeps the task fully observable: the drone's own heading is part
+        # of the observation, so it can tell how far off it is. Anchoring to a random
+        # per-episode yaw instead would make the target unobservable.
+        self._heading_ref_cfg = list(cfg.task.get("heading_ref", [1., 0.]))
+        # Terminate when the drone tips past this angle (degrees); None disables it.
+        _max_tilt = cfg.task.get("max_tilt_deg", None)
+        self.max_tilt_cos = (
+            None if _max_tilt is None
+            else float(torch.cos(torch.tensor(float(_max_tilt) * torch.pi / 180.)))
+        )
 
         super().__init__(cfg, headless)
 
@@ -102,6 +149,34 @@ class Track(IsaacEnv):
         if randomization is not None:
             if "drone" in self.cfg.task.randomization:
                 self.drone.setup_randomization(self.cfg.task.randomization["drone"])
+
+        _has_arm_joints = (
+            hasattr(self.drone, "arm_joint_indices")
+            and self.drone.arm_joint_indices is not None
+        )
+        _arm_hold_cfg = cfg.task.get("arm_hold", None)
+        _arm_hold_requested = (
+            _arm_hold_cfg is not None and _arm_hold_cfg.get("enabled", False)
+        )
+        if _arm_hold_requested and not _has_arm_joints:
+            logging.warning("arm_hold is enabled but this drone has no arm joints.")
+        elif _arm_hold_requested:
+            raw_targets = _arm_hold_cfg.get("joint_positions", [])
+            hold_targets = torch.as_tensor(
+                raw_targets, dtype=torch.float32, device=self.device
+            ).flatten()
+            if hold_targets.numel() < self.drone.num_arm_joints:
+                padded = torch.zeros(self.drone.num_arm_joints, device=self.device)
+                padded[: hold_targets.numel()] = hold_targets
+                hold_targets = padded
+            elif hold_targets.numel() > self.drone.num_arm_joints:
+                hold_targets = hold_targets[: self.drone.num_arm_joints]
+            self._arm_hold_enabled = True
+            self._arm_hold_targets = hold_targets
+            logging.info(
+                "Arm hold enabled with targets=%s",
+                hold_targets.detach().cpu().tolist(),
+            )
 
         if self.wind:
             if randomization is not None:
@@ -117,27 +192,43 @@ class Track(IsaacEnv):
             self.wind_w = torch.zeros(self.num_envs, 3, 8, device=self.device)
             self.wind_i = torch.zeros(self.num_envs, 1, device=self.device)
 
+        def _cfg_pair(key, default_low, default_high):
+            """Read a [low, high] range from the task config, falling back to defaults."""
+            rng = cfg.task.get(key, None)
+            if rng is None:
+                return default_low, default_high
+            low, high = list(rng)
+            return low, high
+
+        # `init_rpy` is in units of pi; yaw spans a full turn by default.
+        _rpy_low, _rpy_high = _cfg_pair("init_rpy", [-.2, -.2, 0.], [0.2, 0.2, 2.])
         self.init_rpy_dist = D.Uniform(
-            torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
-            torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
+            torch.tensor(_rpy_low, dtype=torch.float32, device=self.device) * torch.pi,
+            torch.tensor(_rpy_high, dtype=torch.float32, device=self.device) * torch.pi
         )
         self.traj_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
             torch.tensor([0., 0., 2.], device=self.device) * torch.pi
         )
+        _c_low, _c_high = _cfg_pair("traj_c", -0.6, 0.6)
         self.traj_c_dist = D.Uniform(
-            torch.tensor(-0.6, device=self.device),
-            torch.tensor(0.6, device=self.device)
+            torch.tensor(float(_c_low), device=self.device),
+            torch.tensor(float(_c_high), device=self.device)
         )
+        _scale_low, _scale_high = _cfg_pair("traj_scale", [1.8, 1.8, 1.], [3.2, 3.2, 1.5])
         self.traj_scale_dist = D.Uniform(
-            torch.tensor([1.8, 1.8, 1.], device=self.device),
-            torch.tensor([3.2, 3.2, 1.5], device=self.device)
+            torch.tensor(_scale_low, dtype=torch.float32, device=self.device),
+            torch.tensor(_scale_high, dtype=torch.float32, device=self.device)
         )
+        # Angular rate along the lemniscate: one lap takes ~2*pi/(w*dt) control steps,
+        # so halving `traj_w` halves the demanded flight speed.
+        _w_low, _w_high = _cfg_pair("traj_w", 0.8, 1.1)
         self.traj_w_dist = D.Uniform(
-            torch.tensor(0.8, device=self.device),
-            torch.tensor(1.1, device=self.device)
+            torch.tensor(float(_w_low), device=self.device),
+            torch.tensor(float(_w_high), device=self.device)
         )
-        self.origin = torch.tensor([0., 0., 2.], device=self.device)
+        _origin = list(cfg.task.get("traj_origin", [0., 0., 2.]))
+        self.origin = torch.tensor(_origin, dtype=torch.float32, device=self.device)
 
         self.traj_t0 = torch.pi / 2
         self.traj_c = torch.zeros(self.num_envs, device=self.device)
@@ -146,6 +237,14 @@ class Track(IsaacEnv):
         self.traj_w = torch.ones(self.num_envs, device=self.device)
 
         self.target_pos = torch.zeros(self.num_envs, self.future_traj_steps, 3, device=self.device)
+
+        # Previous *policy* action (pre-controller-transform), for the action-rate penalty.
+        self.prev_action = torch.zeros(self.num_envs, 1, 4, device=self.device)
+        self.policy_action = torch.zeros(self.num_envs, 1, 4, device=self.device)
+        self._has_policy_action = False
+        self._action_captured = False
+        ref = torch.tensor(self._heading_ref_cfg, dtype=torch.float32, device=self.device)
+        self.ref_heading = torch.nn.functional.normalize(ref, dim=-1).expand(self.num_envs, 2)
 
         self.alpha = 0.8
 
@@ -178,7 +277,10 @@ class Track(IsaacEnv):
         self.observation_spec = CompositeSpec({
             "agents": {
                 "observation": UnboundedContinuousTensorSpec((1, obs_dim))
-            }
+            },
+            "info": CompositeSpec({
+                "drone_state": UnboundedContinuousTensorSpec((1, drone_state_dim), device=self.device),
+            }),
         }).expand(self.num_envs).to(self.device)
         self.action_spec = CompositeSpec({
             "agents": {
@@ -202,12 +304,18 @@ class Track(IsaacEnv):
             "tracking_error": UnboundedContinuousTensorSpec(1),
             "tracking_error_ema": UnboundedContinuousTensorSpec(1),
             "action_smoothness": UnboundedContinuousTensorSpec(1),
+            "body_rate_ema": UnboundedContinuousTensorSpec(1),
+            "yaw_rate_ema": UnboundedContinuousTensorSpec(1),
+            "tilt_deg_ema": UnboundedContinuousTensorSpec(1),
+            "action_rate_ema": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.stats = stats_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
-        self.drone._reset_idx(env_ids)
+        self.drone._reset_idx(env_ids, self.training)
+        if self._arm_hold_enabled:
+            self.drone.reset_arm_joints(env_ids, self._arm_hold_targets)
         self.traj_c[env_ids] = self.traj_c_dist.sample(env_ids.shape)
         self.traj_rot[env_ids] = euler_to_quaternion(self.traj_rpy_dist.sample(env_ids.shape))
         self.traj_scale[env_ids] = self.traj_scale_dist.sample(env_ids.shape)
@@ -222,6 +330,9 @@ class Track(IsaacEnv):
             pos + self.envs_positions[env_ids], rot, env_ids
         )
         self.drone.set_velocities(vel, env_ids)
+
+        self.prev_action[env_ids] = 0.
+        self.policy_action[env_ids] = 0.
 
         self.stats[env_ids] = 0.
 
@@ -243,7 +354,20 @@ class Track(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        # The RateController transform stashes the pre-transform policy action here;
+        # that (not the rotor command) is what we want to keep small and smooth.
+        # _pre_sim_step runs once per substep while the action only changes once per
+        # control step, so capture it on the first substep only.
+        raw_action = tensordict.get(("agents", "policy_action"), None)
+        if raw_action is not None and not self._action_captured:
+            self.prev_action[:] = self.policy_action
+            self.policy_action[:] = raw_action
+            self._has_policy_action = True
+            self._action_captured = True
         self.effort = self.drone.apply_action(actions)
+
+    def _post_sim_step(self, tensordict: TensorDictBase):
+        self._action_captured = False
 
         if self.wind:
             t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
@@ -277,6 +401,9 @@ class Track(IsaacEnv):
                 "agents": {
                     "observation": obs,
                 },
+                "info": {
+                    "drone_state": self.drone_state,
+                },
                 "stats": self.stats.clone(),
             },
             self.batch_size,
@@ -302,17 +429,65 @@ class Track(IsaacEnv):
         spin = torch.square(self.drone.vel[..., -1])
         reward_spin = 0.5 / (1.0 + torch.square(spin))
 
+        # --- explicit smoothness / attitude penalties (body frame) ---
+        body_rate = self.drone.vel[..., 3:]
+        rate_xy_sq = torch.square(body_rate[..., :2]).sum(-1)
+        yaw_rate_sq = torch.square(body_rate[..., 2])
+        tilt_cos = self.drone.up[..., 2]
+
+        penalty = (
+            self.penalty_spin_weight * yaw_rate_sq
+            + self.penalty_body_rate_weight * rate_xy_sq
+            + self.penalty_tilt_weight * (1.0 - tilt_cos)  # ~ tilt_angle^2 / 2
+        )
+        if self._has_policy_action:
+            action_sq = torch.square(self.policy_action[..., :3]).sum(-1)
+            action_rate_sq = torch.square(
+                self.policy_action - self.prev_action
+            ).sum(-1)
+            penalty = penalty + (
+                self.penalty_action_weight * action_sq
+                + self.penalty_action_rate_weight * action_rate_sq
+            )
+        else:
+            action_rate_sq = torch.zeros_like(yaw_rate_sq)
+
+        # heading reward: hold a fixed world heading, or face along the trajectory tangent
+        if self.heading_mode == "none" or self.reward_heading_weight == 0.:
+            reward_heading = torch.zeros_like(reward_pose)
+        else:
+            if self.heading_mode == "fixed":
+                ref = self.ref_heading
+            else:  # "tangent"
+                tangent = self.target_pos[:, -1, :2] - self.target_pos[:, 0, :2]
+                ref = torch.nn.functional.normalize(tangent, dim=-1, eps=1e-6)
+            heading_xy = torch.nn.functional.normalize(
+                self.drone.heading[..., :2], dim=-1, eps=1e-6
+            )
+            alignment = (heading_xy * ref.unsqueeze(1)).sum(-1)
+            reward_heading = self.reward_heading_weight * (alignment + 1.0) / 2.0
+
+        self.stats["body_rate_ema"].lerp_(rate_xy_sq.sqrt(), (1 - self.alpha))
+        self.stats["yaw_rate_ema"].lerp_(yaw_rate_sq.sqrt(), (1 - self.alpha))
+        self.stats["tilt_deg_ema"].lerp_(
+            torch.rad2deg(torch.acos(tilt_cos.clamp(-1.0, 1.0))), (1 - self.alpha)
+        )
+        self.stats["action_rate_ema"].lerp_(action_rate_sq.sqrt(), (1 - self.alpha))
+
         reward = (
             reward_pose
-            + reward_pose * (reward_up + reward_spin)
+            + reward_pose * (reward_up + reward_spin + reward_heading)
             + reward_effort
             + reward_action_smoothness
+            - penalty
         )
 
         misbehave = (
-            (self.drone.pos[..., 2] < 0.1)
+            (self.drone.pos[..., 2] < self.ground_reset_height)
             | (distance > self.reset_thres)
         )
+        if self.max_tilt_cos is not None:
+            misbehave = misbehave | (tilt_cos < self.max_tilt_cos)
         hasnan = torch.isnan(self.drone_state).any(-1)
 
         terminated = misbehave | hasnan

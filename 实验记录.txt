@@ -1,0 +1,138 @@
+---------------------------------------------------------------------
+以下实验针对HoverAmovDynaArm，设置三种不同的条件，分别是机械臂不动/机械臂预定义轨迹/机械臂随机轨迹
+记录机械臂对无人机的作用力/力矩
+具体的获取方式为：
+  ▎ 在每个仿真控制步，通过 PhysX 关节约束力接口（get_link_incoming_joint_force）采集无人机与机械
+  ▎ 臂连接处的三维力和力矩。测量点为机械臂第一关节（joint1），即无人机机体（base_link）与机械臂
+  ▎ 第一连杆（link1）之间的旋转关节，所有量均在世界坐标系下表示。
+---------------------------------------------------------------------
+test=fixed — 训练条件复现（基线）
+不挂任何 wrapper，环境与训练一致：
+
+项目	行为
+悬停目标
+始终 (0, 0, 2.0)，不移动
+机械臂
+配置里的固定正弦轨迹（幅度、频率、相位不变）
+用途：在与训练相同的条件下看 checkpoint 表现，作为后续扰动测试的对照。
+
+test=target — 只扰动悬停目标
+启用 MovingTargetWrapper，在每次 _compute_state_and_obs 前调用 step_hook：
+
+每 target_change_interval 步（默认 200，可用 CLI 改）重新随机目标；
+XY：在 [-target_pos_range, +target_pos_range] 内均匀随机（默认 ±1.5 m）；
+Z：固定 2.0 m；
+同步更新 env.target_pos 和场景里目标可视化 marker。
+机械臂仍走训练轨迹，不变。
+
+用途：测策略在目标频繁变化、臂运动与训练相同时的跟踪/悬停能力（类似“动态 setpoint”）。
+
+相关参数：target_change_interval、target_pos_range。
+
+test=target_arm — 目标变化 + 臂轨迹扰动（组合）
+同时启用上述两种机制：
+
+MovingTargetWrapper：与 test=target 相同，周期性随机目标位置。
+ArmPerturbWrapper：在每个 episode 的 _reset_idx 时（与 arm_perturb 相同）：
+对每个臂关节的 幅度、频率 乘随机系数
+mult ∈ [1 - arm_perturb_scale, 1 + arm_perturb_scale]（默认 arm_perturb_scale=0.5 → ±50%）；
+相位不变；幅度 ≥ 0，频率 ≥ 0.05 Hz。
+用途：最接近“实战”的双重扰动——目标在变，臂的运动模式也与训练不完全一致。
+
+相关参数：target_change_interval、target_pos_range、arm_perturb_scale。
+
+
+实验一：
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd python scripts/eval_hover_robustness.py task=HoverAmovDynaArm algo=ppo headless=false checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt test=fixed
+Evaluation results  [mode=fixed]
+============================================================
+  stats.uprightness                       : 1.0000
+  stats.episode_len                       : 499.0000
+  stats.mean_throttle                     : 0.4991
+  stats.return                            : 1987.3628
+  stats.mean_thrust_n                     : 126.3775
+  stats.pos_error                         : 0.0571
+  stats.action_smoothness                 : -0.0013
+  stats.heading_alignment                 : 0.9987
+run-20260601_002626-HoverAmovDynaArm_joint_forces_fixed.npy
+
+实验二：
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py task=HoverAmovDynaArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt \
+test=target target_change_interval=150 target_pos_range=1.5
+============================================================
+Evaluation results  [mode=target]
+============================================================
+  stats.return                            : 2009.5055
+  stats.action_smoothness                 : -0.0013
+  stats.pos_error                         : 2.7818
+  stats.mean_thrust_n                     : 133.5010
+  stats.episode_len                       : 599.0000
+  stats.mean_throttle                     : 0.5108
+  stats.uprightness                       : 0.9173
+  stats.heading_alignment                 : 0.9330
+============================================================
+20260601_002626-HoverAmovDynaArm_joint_forces_target.npy
+
+实验三：改变机械臂的轨迹
+---------------------------------------------------------------------------
+● 改动完成。核心区别对比：
+
+  ┌──────────┬─────────────────────────────┬────────────────────────────────┐
+  │          │         arm_perturb         │       arm_random（新增）       │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 采样方式 │ 原始值 × [1-scale, 1+scale] │ 从 [min, max] 完全独立采样     │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 幅度范围 │ 原始 ±80% → 0.03~1.08 rad   │ 直接指定上限，默认 0.1~1.2 rad │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 频率范围 │ 原始 ±80% → 0.05~0.9 Hz     │ 独立 [0.1, 0.8] Hz             │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 相位     │ 不变（保持训练时的相位）    │ 随机 [0, 2π]，每 episode 不同  │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 视觉效果 │ 与训练轨迹相似              │ 每 episode 完全不同的运动模式  │
+  └──────────┴─────────────────────────────┴────────────────────────────────┘
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 频率范围 │ 原始 ±80% → 0.05~0.9 Hz     │ 独立 [0.1, 0.8] Hz             │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 相位     │ 不变（保持训练时的相位）    │ 随机 [0, 2π]，每 episode 不同  │
+  ├──────────┼─────────────────────────────┼────────────────────────────────┤
+  │ 视觉效果 │ 与训练轨迹相似              │ 每 episode 完全不同的运动模式  │
+  └──────────┴─────────────────────────────┴────────────────────────────────┘
+
+  运行命令：
+
+  OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+  python scripts/eval_hover_robustness.py \
+    task=HoverAmovDynaArm algo=ppo headless=false \
+    checkpoint=.../checkpoint_final.pt \
+    test=arm_random \
+    max_episode_length=700
+
+  可选参数调整幅度范围（例如更激进）：
+    arm_rand_amp_max="[1.5,1.0,0.9,0.6,0.6,0.4]" \
+    arm_rand_freq_min=0.05 arm_rand_freq_max=1.0
+
+OMNIDRONES_AMOV_USD_PATH=/home/benhua/OmniDrones/amov_drone_arm_1.usd \
+python scripts/eval_hover_robustness.py \
+task=HoverAmovDynaArm algo=ppo headless=false \
+checkpoint=/home/benhua/OmniDrones/wandb/run-20260601_002626-amov_drone_dynamic_arm_hover/files/checkpoint_final.pt \
+test=target_arm_random \
+max_episode_length=600 \
+arm_rand_amp_max="[0.5,0.5,0.5,0.5,0.5,0.5]" \
+arm_rand_freq_min=1 \
+arm_rand_freq_max=5
+
+============================================================
+Evaluation results  [mode=target_arm_random]
+============================================================
+  stats.pos_error                         : 0.7281
+  stats.uprightness                       : 0.8736
+  stats.mean_throttle                     : 0.4905
+  stats.return                            : 1925.4176
+  stats.mean_thrust_n                     : 130.5578
+  stats.heading_alignment                 : 0.8748
+  stats.action_smoothness                 : -0.0537
+  stats.episode_len                       : 599.0000
+============================================================
+[2026-06-01 17:58:28,602][root][INFO] - Saved joint force log (600 steps) to joint_forces_target_arm_random.npy  F_mean=[2.77 -1.00 -27.17] N  T_mean=[0.247 0.585 0.064] N·m

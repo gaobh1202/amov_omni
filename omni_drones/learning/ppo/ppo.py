@@ -60,6 +60,18 @@ class PPOConfig:
     # causes destabilizing torques early in training (e.g. heavy quadrotors).
     actor_log_std_init: float = 0.0
 
+    # Bounds on the learned log-std. The floor matters whenever the reward contains a
+    # quadratic penalty on the action: for a state-independent Gaussian,
+    # E[||a||^2] = ||mu||^2 + sum(sigma^2), so such a penalty pushes log_std down with a
+    # gradient proportional to its weight, while `entropy_coef` pushes back only with
+    # 4*entropy_coef/sigma. With the default coefficient the penalty wins by orders of
+    # magnitude and exploration collapses within a few hundred iterations, long before
+    # the task is learned. Raise the floor (e.g. -1.6 -> sigma >= 0.2) to prevent that.
+    actor_log_std_min: float = -5.0
+    actor_log_std_max: float = 2.0
+
+    entropy_coef: float = 0.001
+
 cs = ConfigStore.instance()
 cs.store("ppo", node=PPOConfig, group="algo")
 cs.store("ppo_priv", node=PPOConfig(priv_actor=True, priv_critic=True), group="algo")
@@ -76,10 +88,18 @@ def make_mlp(num_units):
 
 
 class Actor(nn.Module):
-    def __init__(self, action_dim: int, log_std_init: float = 0.0) -> None:
+    def __init__(
+        self,
+        action_dim: int,
+        log_std_init: float = 0.0,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+    ) -> None:
         super().__init__()
         self.actor_mean = nn.LazyLinear(action_dim)
         self.actor_std = nn.Parameter(torch.full((action_dim,), log_std_init))
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         self._mean_zero_init_done = False
 
     def forward(self, features: torch.Tensor):
@@ -95,7 +115,9 @@ class Actor(nn.Module):
                 nn.init.zeros_(self.actor_mean.bias)
             self._mean_zero_init_done = True
         loc = self.actor_mean(features)
-        scale = torch.exp(self.actor_std.clamp(-5.0, 2.0)).expand_as(loc)
+        scale = torch.exp(
+            self.actor_std.clamp(self.log_std_min, self.log_std_max)
+        ).expand_as(loc)
         return loc, scale
 
 
@@ -132,7 +154,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.001
+        self.entropy_coef = cfg.entropy_coef
         self.clip_param = 0.1
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
@@ -150,13 +172,15 @@ class PPOPolicy(TensorDictModuleBase):
                 ),
                 CatTensors(["feature", "context"], "feature"),
                 TensorDictModule(
-                    nn.Sequential(make_mlp([256, 256]), Actor(self.action_dim, cfg.actor_log_std_init)),
+                    nn.Sequential(make_mlp([256, 256]), Actor(self.action_dim, cfg.actor_log_std_init,
+                                          cfg.actor_log_std_min, cfg.actor_log_std_max)),
                     ["feature"], ["loc", "scale"]
                 )
             )
         else:
             actor_module=TensorDictModule(
-                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim, cfg.actor_log_std_init)),
+                nn.Sequential(make_mlp([256, 256, 256]), Actor(self.action_dim, cfg.actor_log_std_init,
+                                          cfg.actor_log_std_min, cfg.actor_log_std_max)),
                 [("agents", "observation")], ["loc", "scale"]
             )
         self.actor: ProbabilisticActor = ProbabilisticActor(

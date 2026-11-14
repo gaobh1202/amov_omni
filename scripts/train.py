@@ -199,6 +199,26 @@ def main(cfg):
             nbins = int(action_transform.split(":")[1])
             transform = FromDiscreteAction(nbins=nbins)
             transforms.append(transform)
+        elif action_transform == "rate":
+            max_rate = cfg.task.get("max_body_rate", None)
+            thrust_range = cfg.task.get("thrust_range", None)
+            transform = RateController(
+                base_env.controller,
+                max_rate=(
+                    max_rate if max_rate is None or isinstance(max_rate, (int, float))
+                    else list(max_rate)
+                ),
+                thrust_range=list(thrust_range) if thrust_range is not None else None,
+            )
+            logging.info(
+                "RateController: max_rate=%s rad/s, thrust_range=%s",
+                transform.max_rate.tolist(),
+                (transform.thrust_low, transform.thrust_high),
+            )
+            transforms.append(transform)
+        elif action_transform == "attitude":
+            transform = AttitudeController(base_env.controller)
+            transforms.append(transform)
         else:
             raise NotImplementedError(f"Unknown action transform: {action_transform}")
 

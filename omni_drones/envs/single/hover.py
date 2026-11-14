@@ -118,6 +118,13 @@ class Hover(IsaacEnv):
         self.reward_action_smoothness_weight = cfg.task.reward_action_smoothness_weight
         self.reward_distance_scale = cfg.task.reward_distance_scale
         self.reward_up_weight = float(cfg.task.get("reward_up_weight", 0.5))
+        # Long-horizon stability bonus: rewards a *sustained* low position
+        # error (tracked via an EMA over ~1/(1-alpha) steps) rather than only
+        # the instantaneous error reward_pose already covers. Default weight
+        # 0.0 keeps every existing task's behavior unchanged unless opted in.
+        self.reward_longhorizon_weight = float(cfg.task.get("reward_longhorizon_weight", 0.0))
+        self.reward_longhorizon_scale = float(cfg.task.get("reward_longhorizon_scale", 1.0))
+        self.longhorizon_alpha = float(cfg.task.get("longhorizon_alpha", 0.98))
         self.time_encoding = cfg.task.time_encoding
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
@@ -147,6 +154,10 @@ class Hover(IsaacEnv):
         super().__init__(cfg, headless)
 
         self.drone.initialize()
+
+        # EMA of position error over a long horizon (~1/(1-longhorizon_alpha)
+        # steps), used by the optional long-horizon stability reward below.
+        self._pos_error_ema = torch.zeros(self.num_envs, 1, device=self.device)
 
         # Arm control setup (for robots with extra arm joints, e.g. AmovDrone).
         self._arm_motion_enabled = False
@@ -243,6 +254,79 @@ class Hover(IsaacEnv):
             logging.info(
                 "arm_trajectory enabled: %d joints | amplitudes=%s | frequencies=%s | stiffness=%.1f | damping=%.1f",
                 n, amplitudes.tolist(), frequencies.tolist(), stiffness_val, damping_val,
+            )
+
+        # Real recorded-episode arm replay (arm_replay). Drives the arm with
+        # actual IK-generated joint trajectories (e.g. a recorded grasp
+        # episode) instead of a procedural sinusoid, so training sees the
+        # non-periodic, task-directed motion real manipulation produces.
+        # Each env independently samples one episode + a random start frame
+        # at every reset, then loops that episode for the rest of the episode.
+        # Takes priority over arm_trajectory/arm_motion but is overridden by
+        # arm_hold.
+        self._arm_replay_enabled = False
+        self._arm_replay_targets: torch.Tensor = None   # (n_episodes, max_len, num_arm_joints)
+        self._arm_replay_lengths: torch.Tensor = None   # (n_episodes,)
+        self._arm_replay_episode_idx: torch.Tensor = None  # (num_envs,)
+        self._arm_replay_start_frame: torch.Tensor = None  # (num_envs,)
+        self._arm_replay_dataset_fps = 30.0
+
+        _arm_replay_cfg = cfg.task.get("arm_replay", None)
+        _arm_replay_requested = (
+            _arm_replay_cfg is not None
+            and _arm_replay_cfg.get("enabled", False)
+            and _arm_replay_cfg.get("episode_npz", None)
+        )
+        if _arm_replay_requested and self._arm_hold_enabled:
+            logging.info("arm_replay is ignored because arm_hold is enabled.")
+        elif _arm_replay_requested and _has_arm_joints:
+            self._arm_replay_enabled = True
+            self._arm_trajectory_enabled = False
+            self._arm_motion_enabled = False
+            n = self.drone.num_arm_joints
+
+            import numpy as np
+            episode_paths = list(_arm_replay_cfg.get("episode_npz", []))
+            episodes = []
+            for p in episode_paths:
+                _d = np.load(p)
+                _joint_rad = _d["joint_rad"]              # (T, 6)
+                _gripper = _d["gripper_m"]                 # (T,)
+                _targets = np.concatenate(
+                    [_joint_rad, _gripper[:, None], -_gripper[:, None]], axis=1
+                )                                          # (T, 8)
+                episodes.append(_targets[:, :n])
+            max_len = max(e.shape[0] for e in episodes)
+            n_ep = len(episodes)
+            padded = np.zeros((n_ep, max_len, n), dtype=np.float32)
+            lengths = np.zeros((n_ep,), dtype=np.int64)
+            for i, e in enumerate(episodes):
+                padded[i, : e.shape[0]] = e
+                if e.shape[0] < max_len:
+                    padded[i, e.shape[0]:] = e[-1]
+                lengths[i] = e.shape[0]
+
+            self._arm_replay_targets = torch.as_tensor(padded, device=self.device)
+            self._arm_replay_lengths = torch.as_tensor(lengths, device=self.device)
+            self._arm_replay_dataset_fps = float(_arm_replay_cfg.get("dataset_fps", 30.0))
+            self._arm_replay_episode_idx = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device
+            )
+            self._arm_replay_start_frame = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device
+            )
+
+            stiffness_val = float(_arm_replay_cfg.get("stiffness", 500.0))
+            damping_val = float(_arm_replay_cfg.get("damping", 50.0))
+            stiffness = torch.full((self.drone._view.count, n), stiffness_val, device=self.device)
+            damping = torch.full((self.drone._view.count, n), damping_val, device=self.device)
+            self.drone._view.set_gains(stiffness, damping, joint_indices=self.drone.arm_joint_indices)
+
+            logging.info(
+                "arm_replay enabled: %d episodes loaded (lengths=%s, max_len=%d, fps=%.1f)"
+                " | stiffness=%.1f | damping=%.1f",
+                n_ep, lengths.tolist(), max_len, self._arm_replay_dataset_fps,
+                stiffness_val, damping_val,
             )
 
         if "drone" in self.randomization:
@@ -398,6 +482,10 @@ class Hover(IsaacEnv):
             "agents": CompositeSpec({
                 "observation": UnboundedContinuousTensorSpec((1, observation_dim), device=self.device),
                 "intrinsics": self.drone.intrinsics_spec.unsqueeze(0).to(self.device)
+            }),
+            # Full drone state, consumed by RateController/AttitudeController action transforms.
+            "info": CompositeSpec({
+                "drone_state": UnboundedContinuousTensorSpec((1, drone_state_dim), device=self.device),
             })
         }).expand(self.num_envs).to(self.device)
         self.action_spec = CompositeSpec({
@@ -440,6 +528,27 @@ class Hover(IsaacEnv):
             self.drone.reset_arm_joints(env_ids)
         elif self._arm_trajectory_enabled:
             self.drone.reset_arm_joints(env_ids)
+        elif self._arm_replay_enabled:
+            # Each env independently samples which recorded episode to play
+            # and where in it to start, so a batch of envs sees many
+            # different phases of the (few) recorded demonstrations at once.
+            n = len(env_ids)
+            n_ep = self._arm_replay_targets.shape[0]
+            ep_idx = torch.randint(0, n_ep, (n,), device=self.device)
+            self._arm_replay_episode_idx[env_ids] = ep_idx
+            ep_len = self._arm_replay_lengths[ep_idx]
+            start_frame = (torch.rand(n, device=self.device) * ep_len.float()).long()
+            self._arm_replay_start_frame[env_ids] = start_frame
+            targets0 = self._arm_replay_targets[ep_idx, start_frame]  # (n, num_arm_joints)
+            self.drone._view.set_joint_positions(
+                targets0, env_indices=env_ids, joint_indices=self.drone.arm_joint_indices
+            )
+            self.drone._view.set_joint_velocities(
+                torch.zeros_like(targets0), env_indices=env_ids, joint_indices=self.drone.arm_joint_indices
+            )
+            self.drone._view.set_joint_position_targets(
+                targets0, env_indices=env_ids, joint_indices=self.drone.arm_joint_indices
+            )
 
         pos = self.init_pos_dist.sample((*env_ids.shape, 1))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
@@ -469,6 +578,7 @@ class Hover(IsaacEnv):
         self.target_heading[env_ids] = quat_axis(target_rot.squeeze(1), 0).unsqueeze(1)
         self.target_vis.set_world_poses(orientations=target_rot, env_indices=env_ids)
 
+        self._pos_error_ema[env_ids] = 0.
         self.stats[env_ids] = 0.
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
@@ -489,24 +599,29 @@ class Hover(IsaacEnv):
         # For Firefly: hover_cmd ≈ -0.183, only ~18% clamped → trains OK without fix.
         # With scaling by (1 - |offset|), actions in [-1,1] map exactly to [-1, 0.032]
         # with zero clamping → symmetric exploration around hover.
-        if not hasattr(self, "_hover_cmd_offset"):
-            with torch.no_grad():
-                _g = self.drone.gravity.mean()
-                _kf = self.drone.KF.sum(-1).mean().clamp_min(1e-9)
-                _hover_frac = (_g / _kf).clamp(0.0, 1.0)
-                self._hover_cmd_offset = float((2.0 * _hover_frac - 1.0).item())
-                # Symmetric scale: ±1 action maps to ±scale around hover_cmd, no clamp
-                self._hover_cmd_scale = float(1.0 - abs(self._hover_cmd_offset))
-            logging.info(
-                "Hover action normalization: hover_frac=%.4f  hover_cmd=%.4f  scale=%.4f"
-                "  (action=0 → hover, action=±1 → cmd=%.3f/%.3f)",
-                float(_hover_frac.item()),
-                self._hover_cmd_offset,
-                self._hover_cmd_scale,
-                self._hover_cmd_offset - self._hover_cmd_scale,
-                self._hover_cmd_offset + self._hover_cmd_scale,
-            )
-        actions = (actions * self._hover_cmd_scale + self._hover_cmd_offset).clamp(-1.0, 1.0)
+        #
+        # Skip when a controller transform (rate/attitude) is active: the Transform
+        # already converts policy output to rotor cmds, so re-scaling here would corrupt them.
+        _use_ctrl_transform = self.cfg.task.get("action_transform", None) in ("rate", "attitude")
+        if not _use_ctrl_transform:
+            if not hasattr(self, "_hover_cmd_offset"):
+                with torch.no_grad():
+                    _g = self.drone.gravity.mean()
+                    _kf = self.drone.KF.sum(-1).mean().clamp_min(1e-9)
+                    _hover_frac = (_g / _kf).clamp(0.0, 1.0)
+                    self._hover_cmd_offset = float((2.0 * _hover_frac - 1.0).item())
+                    # Symmetric scale: ±1 action maps to ±scale around hover_cmd, no clamp
+                    self._hover_cmd_scale = float(1.0 - abs(self._hover_cmd_offset))
+                logging.info(
+                    "Hover action normalization: hover_frac=%.4f  hover_cmd=%.4f  scale=%.4f"
+                    "  (action=0 → hover, action=±1 → cmd=%.3f/%.3f)",
+                    float(_hover_frac.item()),
+                    self._hover_cmd_offset,
+                    self._hover_cmd_scale,
+                    self._hover_cmd_offset - self._hover_cmd_scale,
+                    self._hover_cmd_offset + self._hover_cmd_scale,
+                )
+            actions = (actions * self._hover_cmd_scale + self._hover_cmd_offset).clamp(-1.0, 1.0)
 
         self.effort = self.drone.apply_action(actions)
         if self._arm_hold_enabled:
@@ -524,6 +639,8 @@ class Hover(IsaacEnv):
             )
         elif self._arm_trajectory_enabled:
             self._apply_arm_trajectory()
+        elif self._arm_replay_enabled:
+            self._apply_arm_replay()
 
     def _apply_arm_trajectory(self):
         """Drive all arm joints with independent sinusoidal trajectories."""
@@ -537,6 +654,23 @@ class Hover(IsaacEnv):
                 + self._arm_traj_phases.unsqueeze(0)
             )
         )  # (num_envs, num_arm_joints)
+        self.drone._view.set_joint_position_targets(
+            pos, joint_indices=self.drone.arm_joint_indices
+        )
+
+    def _apply_arm_replay(self):
+        """Drive all arm joints from a recorded episode's real joint
+        trajectory, looping each env's chosen episode from its own randomly
+        sampled start frame."""
+        if self.drone.arm_joint_indices is None or self.drone.num_arm_joints == 0:
+            return
+        ep_idx = self._arm_replay_episode_idx                     # (num_envs,)
+        ep_len = self._arm_replay_lengths[ep_idx]                  # (num_envs,)
+        elapsed_frames = (
+            self.progress_buf.float() * (self.dt * self.substeps) * self._arm_replay_dataset_fps
+        ).long()
+        frame = (self._arm_replay_start_frame + elapsed_frames) % ep_len  # (num_envs,), looped
+        pos = self._arm_replay_targets[ep_idx, frame]              # (num_envs, num_arm_joints)
         self.drone._view.set_joint_position_targets(
             pos, joint_indices=self.drone.arm_joint_indices
         )
@@ -563,6 +697,9 @@ class Hover(IsaacEnv):
                 "agents": {
                     "observation": obs,
                     "intrinsics": self.drone.intrinsics,
+                },
+                "info": {
+                    "drone_state": safe_drone_state,
                 },
                 "stats": self.stats.clone(),
             },
@@ -616,6 +753,22 @@ class Hover(IsaacEnv):
         # keep the drone right-side-up from the first episode.
         reward_up_standalone = self.reward_up_weight * ((safe_up[..., 2] + 1.0) / 2.0)
 
+        # Long-horizon stability bonus: an EMA of pos_error over ~1/(1-alpha)
+        # steps, rewarded the same way reward_pose rewards the instantaneous
+        # error. Unlike reward_pose, this stays low (and keeps penalizing)
+        # even after the drone re-converges following a disturbance, until
+        # the *sustained* error has actually come back down -- pushing the
+        # policy to reject disturbances quickly rather than merely survive
+        # them one step at a time. Weight defaults to 0.0 (no-op) unless a
+        # task config opts in.
+        self._pos_error_ema = (
+            self.longhorizon_alpha * self._pos_error_ema
+            + (1 - self.longhorizon_alpha) * torch.nan_to_num(pos_error, nan=0.0)
+        )
+        reward_longhorizon = self.reward_longhorizon_weight * torch.exp(
+            -self.reward_longhorizon_scale * self._pos_error_ema
+        )
+
         assert reward_pose.shape == reward_up.shape == reward_spin.shape
         reward = (
             reward_pose
@@ -624,6 +777,7 @@ class Hover(IsaacEnv):
             + reward_action_smoothness
             + reward_alive
             + reward_up_standalone
+            + reward_longhorizon
         )
         reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 

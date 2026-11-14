@@ -32,6 +32,9 @@ from tensordict.nn import make_functional
 from torchrl.data import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
 from tensordict import TensorDict
 
+import omni.isaac.core.utils.prims as prim_utils
+from omni.isaac.core.simulation_context import SimulationContext
+
 from omni_drones.views import RigidPrimView
 from omni_drones.actuators.rotor_group import RotorGroup
 from omni_drones.controllers import ControllerBase
@@ -97,7 +100,7 @@ class MultirotorBase(RobotBase):
                 track_contact_forces=track_contact_forces,
                 shape=self.shape,
             )
-            self.base_link.initialize()
+            self.base_link.initialize(SimulationContext.instance().physics_sim_view)
             print(self._view.dof_names)
             print(self._view._dof_indices)
             rotor_joint_indices = [
@@ -116,14 +119,34 @@ class MultirotorBase(RobotBase):
             self.base_link = self._view
             self.prim_paths_expr = prim_paths_expr
 
-        self.rotors_view = RigidPrimView(
-            # prim_paths_expr=f"{self.prim_paths_expr}/rotor_[0-{self.num_rotors-1}]",
-            prim_paths_expr=f"{self.prim_paths_expr}/rotor_*",
-            name="rotors",
-            shape=(*self.shape, self.num_rotors)
-        )
-        self.rotors_view.initialize()
+        # Some assets model their rotors as visuals only, with no rotor rigid
+        # bodies to view (AM-Bench's quad_scorpion/hexa_scorpion). Such a drone
+        # has no per-rotor poses to read, so it must build its rotor wrench from
+        # static body-frame geometry and apply it to base_link itself -- see
+        # aetos_multiam's RotorlessMultirotor, which overrides apply_action.
+        if prim_utils.find_matching_prim_paths(f"{self.prim_paths_expr}/rotor_*"):
+            self.rotors_view = RigidPrimView(
+                # prim_paths_expr=f"{self.prim_paths_expr}/rotor_[0-{self.num_rotors-1}]",
+                prim_paths_expr=f"{self.prim_paths_expr}/rotor_*",
+                name="rotors",
+                shape=(*self.shape, self.num_rotors)
+            )
+            self.rotors_view.initialize(SimulationContext.instance().physics_sim_view)
+        else:
+            self.rotors_view = None
 
+        self._setup_rotor_model_and_buffers()
+
+
+    def _setup_rotor_model_and_buffers(self):
+        """Rotor actuator model, state buffers, and the mass/inertia/thrust
+        reference values -- everything after the stage handles exist.
+
+        Split out of ``initialize`` so a drone whose handles have to be
+        created differently (an asset with no rotor rigid bodies, or whose
+        articulation root is not the spawn prim) can reuse this verbatim
+        instead of copying it -- see aetos_multiam's RotorlessMultirotor.
+        """
         rotor_config = self.params["rotor_configuration"]
         self.rotors = RotorGroup(rotor_config, dt=self.dt).to(self.device)
 

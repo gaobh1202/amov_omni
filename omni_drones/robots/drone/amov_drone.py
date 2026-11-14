@@ -36,6 +36,7 @@ from omni_drones.actuators.rotor_group import RotorGroup
 from omni_drones.robots.drone.multirotor import MultirotorBase
 from omni_drones.robots.robot import ASSET_PATH
 from omni_drones.utils.torch import quat_axis, quat_rotate
+from omni.isaac.core.simulation_context import SimulationContext
 from omni_drones.views import RigidPrimView
 
 
@@ -178,7 +179,7 @@ class AmovDrone(MultirotorBase):
             name="rotors",
             shape=(*self.shape, self.num_rotors),
         )
-        self.rotors_view.initialize()
+        self.rotors_view.initialize(SimulationContext.instance().physics_sim_view)
 
         if self._env_flag("OMNIDRONES_AMOV_DISABLE_ROTOR_COLLISIONS"):
             disabled_cnt = 0
